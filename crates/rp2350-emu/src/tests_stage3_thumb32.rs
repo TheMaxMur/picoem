@@ -4704,3 +4704,65 @@ mod worker_bus_exec {
         let _ = pc;
     }
 }
+
+// ===========================================================================
+// DSP and FP-transfer forms an embassy-rp firmware image uses. Encodings
+// are `llvm-mc -triple=thumbv8m.main-none-eabi -mcpu=cortex-m33
+// -show-encoding` output.
+mod dsp_and_fp_transfer_gaps {
+    // ===========================================================================
+    use super::*;
+
+    /// PKHBT/PKHTB: halfword pack, flags untouched. Rn = r1, Rm = r2, Rd = r0.
+    #[test]
+    fn pkhbt_pkhtb() {
+        let (mut c, mut bus) = core_and_bus();
+        for ((hw0, hw1), want) in [
+            ((0xEAC1u16, 0x0002u16), 0x9234_1111u32), // pkhbt r0, r1, r2
+            ((0xEAC1, 0x2002), 0x3456_1111),          // pkhbt r0, r1, r2, lsl #8
+            ((0xEAC1, 0x2022), 0x2222_3456),          // pkhtb r0, r1, r2, asr #8
+            ((0xEAC1, 0x0022), 0x2222_FFFF),          // pkhtb r0, r1, r2, asr #32
+        ] {
+            c.set_reg(1, 0x2222_1111);
+            c.set_reg(2, 0x9234_5678);
+            c.regs.xpsr = (1 << 24) | 0xF800_0000;
+            c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+            assert_eq!(c.reg(0), want, "{hw0:#06x} {hw1:#06x}");
+            assert_eq!(c.regs.xpsr & 0xF800_0000, 0xF800_0000, "flags untouched");
+        }
+    }
+
+    /// Byte-wise saturating and halving add/subtract. Lanes (low byte
+    /// first): r1 = [0x7F, 0x80, 0xFF, 0x01], r2 = [0x01, 0x01, 0x02, 0xFF].
+    #[test]
+    fn byte_saturating_and_halving_forms() {
+        let (mut c, mut bus) = core_and_bus();
+        let (a, b) = (0x01FF_807Fu32, 0xFF02_0101u32);
+        for ((hw0, hw1), want, name) in [
+            // signed lanes: 127+1, -128+1, -1+2, 1+(-1)
+            ((0xFA81u16, 0xF012u16), 0x0001_817Fu32, "qadd8"),
+            // 127-1, -128-1 sat, -1-2, 1-(-1)
+            ((0xFAC1, 0xF012), 0x02FD_807E, "qsub8"),
+            // (127+1)>>1 = 64, (-127)>>1 = -64, 1>>1 = 0, 0
+            ((0xFA81, 0xF022), 0x0000_C040, "shadd8"),
+            // 126>>1 = 63, -129>>1 = -65, -3>>1 = -2, 2>>1 = 1
+            ((0xFAC1, 0xF022), 0x01FE_BF3F, "shsub8"),
+            // unsigned lanes: 127+1, 128+1, 255+2 sat, 1+255 sat
+            ((0xFA81, 0xF052), 0xFFFF_8180, "uqadd8"),
+            // 127-1, 128-1, 255-2, 1-255 sat
+            ((0xFAC1, 0xF052), 0x00FD_7F7E, "uqsub8"),
+            // 128>>1, 129>>1, 257>>1, 256>>1
+            ((0xFA81, 0xF062), 0x8080_4040, "uhadd8"),
+            // 126>>1 = 63, 127>>1 = 63, 253>>1 = 126, -254>>1 = -127
+            ((0xFAC1, 0xF062), 0x817E_3F3F, "uhsub8"),
+        ] {
+            c.set_reg(1, a);
+            c.set_reg(2, b);
+            c.regs.set_ge_flags(0b1010);
+            c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+            assert_eq!(c.reg(0), want, "{name}");
+            assert_eq!(c.regs.ge_flags(), 0b1010, "{name} leaves GE alone");
+        }
+    }
+
+}
