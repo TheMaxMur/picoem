@@ -239,7 +239,15 @@ impl ThreadedEmulator {
             usbctrl,
             warned_clk_enable_clear: _,
             reservation: _,
+            external_mmio,
         } = bus;
+        // Host-mounted MMIO devices are Serial-only
+        // (`Emulator::mount_mmio` refuses a Threaded emulator); a mount
+        // made straight on `Bus` would be silently dropped here.
+        debug_assert!(
+            external_mmio.is_empty(),
+            "MMIO mounts are Serial-only; the threaded runtime cannot honour them"
+        );
 
         let shared_mem = Arc::new(SharedMemory::from_memory(
             memory,

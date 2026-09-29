@@ -1,4 +1,5 @@
 pub mod clocks;
+pub mod mmio_device;
 pub mod peripherals;
 pub mod ppb;
 
@@ -567,6 +568,9 @@ pub struct Bus {
     /// write to that word by any master clears the corresponding
     /// reservation. See HLD §4.7.
     pub reservation: [Option<u32>; 2],
+    /// Host-mounted MMIO devices over the peripheral window, consulted
+    /// before the built-in dispatch. Serial-only; see [`mmio_device`].
+    pub(crate) external_mmio: Vec<mmio_device::MmioMount>,
 }
 
 impl Bus {
@@ -669,6 +673,7 @@ impl Bus {
             active_pc: [0; 2],
             mmio_trace_sink: None,
             reservation: [None, None],
+            external_mmio: Vec::new(),
         }
     }
 
@@ -1193,6 +1198,12 @@ impl Bus {
         }
         self.raise_irqs_u64(ext_irqs);
 
+        // Host-mounted devices (see `mmio_device`) tick after the
+        // built-in peripherals.
+        if !self.external_mmio.is_empty() {
+            self.tick_mmio(sys_clks);
+        }
+
         // DMA ticks after peripherals produce DREQ (HLD V5 §5.6).
         // Loop once per advanced sysclk so DMA throughput tracks the
         // step quantum (HLD 2026.05.06 §3 — "DMA pacing within step
@@ -1560,6 +1571,18 @@ impl Bus {
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
 
+        // Host-mounted devices take precedence over the built-in dispatch.
+        if !self.external_mmio.is_empty()
+            && matches!(region, 0x4 | 0x5)
+            && let Some((index, offset, _)) = self.find_mmio(addr)
+        {
+            let val = self.mmio_read(index, offset, 1, core) as u8;
+            if self.mmio_trace_enabled {
+                self.emit_mmio_trace('R', 1, addr, val as u32, core);
+            }
+            return val;
+        }
+
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
             _ => addr & 0x0FFF_FFFF,
@@ -1761,6 +1784,18 @@ impl Bus {
         if region == 0x4 && alias != 0 {
             self.last_access_cycles += 2;
             self.extra_wait_states += 2;
+        }
+
+        // Host-mounted devices take precedence over the built-in dispatch.
+        if !self.external_mmio.is_empty()
+            && matches!(region, 0x4 | 0x5)
+            && let Some((index, offset, alias)) = self.find_mmio(addr)
+        {
+            self.mmio_write(index, offset, val as u32, 1, alias, core);
+            if self.mmio_trace_enabled {
+                self.emit_mmio_trace('W', 1, addr, val as u32, core);
+            }
+            return;
         }
 
         let offset = addr & 0x00FF_FFFF;
@@ -2323,6 +2358,18 @@ impl Bus {
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
 
+        // Host-mounted devices take precedence over the built-in dispatch.
+        if !self.external_mmio.is_empty()
+            && matches!(region, 0x4 | 0x5)
+            && let Some((index, offset, _)) = self.find_mmio(addr)
+        {
+            let val = self.mmio_read(index, offset, 2, core) as u16;
+            if self.mmio_trace_enabled {
+                self.emit_mmio_trace('R', 2, addr, val as u32, core);
+            }
+            return val;
+        }
+
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
             _ => addr & 0x0FFF_FFFF,
@@ -2539,6 +2586,18 @@ impl Bus {
         if region == 0x4 && alias != 0 {
             self.last_access_cycles += 2;
             self.extra_wait_states += 2;
+        }
+
+        // Host-mounted devices take precedence over the built-in dispatch.
+        if !self.external_mmio.is_empty()
+            && matches!(region, 0x4 | 0x5)
+            && let Some((index, offset, alias)) = self.find_mmio(addr)
+        {
+            self.mmio_write(index, offset, val as u32, 2, alias, core);
+            if self.mmio_trace_enabled {
+                self.emit_mmio_trace('W', 2, addr, val as u32, core);
+            }
+            return;
         }
 
         let offset = addr & 0x00FF_FFFF;
@@ -3005,6 +3064,18 @@ impl Bus {
         self.last_access_cycles = cycles;
         self.extra_wait_states += extra;
 
+        // Host-mounted devices take precedence over the built-in dispatch.
+        if !self.external_mmio.is_empty()
+            && matches!(region, 0x4 | 0x5)
+            && let Some((index, offset, _)) = self.find_mmio(addr)
+        {
+            let val = self.mmio_read(index, offset, 4, core);
+            if self.mmio_trace_enabled {
+                self.emit_mmio_trace('R', 4, addr, val, core);
+            }
+            return val;
+        }
+
         let offset = match region {
             0x2 => addr & 0x00FF_FFFF, // strip SRAM alias bits [27:24]
             _ => addr & 0x0FFF_FFFF,
@@ -3152,6 +3223,18 @@ impl Bus {
         if region == 0x4 && alias != 0 {
             self.last_access_cycles += 2;
             self.extra_wait_states += 2;
+        }
+
+        // Host-mounted devices take precedence over the built-in dispatch.
+        if !self.external_mmio.is_empty()
+            && matches!(region, 0x4 | 0x5)
+            && let Some((index, offset, alias)) = self.find_mmio(addr)
+        {
+            self.mmio_write(index, offset, val, 4, alias, core);
+            if self.mmio_trace_enabled {
+                self.emit_mmio_trace('W', 4, addr, val, core);
+            }
+            return;
         }
 
         let offset = addr & 0x00FF_FFFF;

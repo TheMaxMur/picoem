@@ -147,6 +147,7 @@ mod pio_tests;
 mod tests_narrow;
 
 pub use self::bus::Bus;
+pub use self::bus::mmio_device::{MmioAliasing, MmioCtx, MmioDevice, MmioHandle, MountError};
 pub use self::core::CoreCounters;
 pub use self::core::CortexM33;
 pub use self::core_riscv::Hazard3;
@@ -1404,6 +1405,23 @@ impl Emulator {
         } else {
             self.bus.read32(addr, 0)
         }
+    }
+
+    /// Mount a host-side peripheral model over the peripheral window —
+    /// see [`bus::mmio_device`] for the access contract. Serial only: the
+    /// threaded runtime does not consult mounts, so a Threaded emulator
+    /// gets [`MountError::SerialOnly`].
+    pub fn mount_mmio<D: MmioDevice>(
+        &mut self,
+        base: u32,
+        size: u32,
+        aliasing: MmioAliasing,
+        device: D,
+    ) -> Result<MmioHandle, MountError> {
+        if self.execution_model == ExecutionModel::Threaded {
+            return Err(MountError::SerialOnly);
+        }
+        self.bus.mount_mmio(base, size, aliasing, device)
     }
 }
 
