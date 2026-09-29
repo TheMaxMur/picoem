@@ -564,8 +564,12 @@ impl CortexM33 {
     /// coproc is 10 or 11.
     pub(crate) fn fpu_execute<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
-        if coproc == 11 {
-            // Double-precision not present on RP2350
+        // cp11 is double precision. The RP2350's single-precision FPU has
+        // no double arithmetic, but it still moves D registers (Dn is
+        // S2n:S2n+1): VLDR/VSTR/VLDM/VSTM/VPUSH/VPOP .64 (the LDC/STC
+        // space, hw0[11:9] = 0b110) and VMOV between two core registers
+        // and a D register. Everything else on cp11 stays undefined.
+        if coproc == 11 && (hw0 >> 9) & 0x7 != 0b110 {
             return self.thumb32_undefined(hw0, hw1, bus);
         }
 
@@ -600,6 +604,10 @@ impl CortexM33 {
         let hw0_15_8 = (hw0 >> 8) & 0xFF;
         if hw0_15_8 == 0xFE && hw1 & 0x10 == 0 {
             return self.fpu_v8m_dp(hw0, hw1);
+        }
+
+        if coproc == 11 {
+            return self.fpu_d_transfer(hw0, hw1, bus);
         }
 
         // Distinguish data-processing / register-transfer from load/store
@@ -1207,6 +1215,77 @@ impl CortexM33 {
                 count as u32 // store: N cycles
             }
         }
+    }
+
+    /// cp11 transfers on the single-precision FPU (see `fpu_execute`):
+    ///
+    /// ```text
+    /// VMOV Dm <-> Rt, Rt2:  hw0 = 1110_1100_010L_Rt2  hw1 = Rt_1011_00M1_Vm
+    /// VLDR/VSTR .64:        hw0 = 1110_1101_UD0L_Rn   hw1 = Vd_1011_imm8
+    /// VLDM/VSTM .64 (VPUSH/VPOP): the multiple forms, imm8 = 2 x #regs
+    /// ```
+    ///
+    /// D registers number `D:Vd` / `M:Vm` (D bit high, unlike the S
+    /// form); the FPU has D0-D15, so a set D bit, an odd or zero word
+    /// count, or a list past D15 is undefined.
+    fn fpu_d_transfer<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+        let p = (hw0 >> 8) & 1;
+        let u = (hw0 >> 7) & 1;
+        let w = (hw0 >> 5) & 1;
+        let l = (hw0 >> 4) & 1;
+        let rn = (hw0 & 0xF) as usize;
+
+        // P = U = W = 0 is the 64-bit core-register transfer space.
+        if p == 0 && u == 0 && w == 0 {
+            let d = ((hw1 >> 1) & 0x10 | hw1 & 0xF) as usize;
+            if hw0 & 0x40 == 0 || hw1 & 0xD0 != 0x10 || d >= 16 {
+                return self.thumb32_undefined(hw0, hw1, bus);
+            }
+            let (rt, rt2) = (((hw1 >> 12) & 0xF) as usize, rn);
+            if l == 0 {
+                self.regs.s[2 * d] = f32::from_bits(self.regs.r[rt]);
+                self.regs.s[2 * d + 1] = f32::from_bits(self.regs.r[rt2]);
+            } else {
+                self.regs.r[rt] = self.regs.s[2 * d].to_bits();
+                self.regs.r[rt2] = self.regs.s[2 * d + 1].to_bits();
+            }
+            return 1;
+        }
+
+        let d = ((hw0 >> 2) & 0x10 | (hw1 >> 12) & 0xF) as usize;
+        let imm8 = (hw1 & 0xFF) as u32;
+        let single = p == 1 && w == 0;
+        let words = if single { 2 } else { imm8 };
+        if d >= 16 || words == 0 || words % 2 != 0 || d + (words as usize) / 2 > 16 {
+            return self.thumb32_undefined(hw0, hw1, bus);
+        }
+        let base = if rn == 15 {
+            self.read_pc() & !0x3
+        } else {
+            self.regs.r[rn]
+        };
+        let mut addr = match (single, u != 0) {
+            (true, true) => base.wrapping_add(imm8 << 2),
+            (true, false) => base.wrapping_sub(imm8 << 2),
+            (false, true) => base,
+            (false, false) => base.wrapping_sub(words << 2),
+        };
+        for i in 0..words as usize {
+            if l != 0 {
+                self.regs.s[2 * d + i] = f32::from_bits(self.bus_read32(addr, bus));
+            } else {
+                self.bus_write32(addr, self.regs.s[2 * d + i].to_bits(), bus);
+            }
+            addr = addr.wrapping_add(4);
+        }
+        if !single && w != 0 {
+            self.regs.r[rn] = if u != 0 {
+                base.wrapping_add(words << 2)
+            } else {
+                base.wrapping_sub(words << 2)
+            };
+        }
+        if l != 0 { 1 + words } else { words }
     }
 
     /// Flush lazy FP context.

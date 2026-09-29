@@ -4765,4 +4765,89 @@ mod dsp_and_fp_transfer_gaps {
         }
     }
 
+    /// VMOV between a core-register pair and a D register: Dn = S2n:S2n+1.
+    #[test]
+    fn vmov_core_pair_and_d_register() {
+        let (mut c, mut bus) = core_and_bus();
+        c.set_reg(0, 0x1111_1111);
+        c.set_reg(1, 0x2222_2222);
+        c.execute_one_wide_with_bus(0xEC41, 0x0B10, &mut bus); // vmov d0, r0, r1
+        assert_eq!(c.regs.s[0].to_bits(), 0x1111_1111);
+        assert_eq!(c.regs.s[1].to_bits(), 0x2222_2222);
+
+        c.regs.s[2] = f32::from_bits(0x3333_3333);
+        c.regs.s[3] = f32::from_bits(0x4444_4444);
+        c.execute_one_wide_with_bus(0xEC53, 0x2B11, &mut bus); // vmov r2, r3, d1
+        assert_eq!((c.reg(2), c.reg(3)), (0x3333_3333, 0x4444_4444));
+
+        c.set_reg(4, 0x5555_5555);
+        c.set_reg(5, 0x6666_6666);
+        c.execute_one_wide_with_bus(0xEC45, 0x4B1F, &mut bus); // vmov d15, r4, r5
+        assert_eq!(c.regs.s[30].to_bits(), 0x5555_5555);
+        assert_eq!(c.regs.s[31].to_bits(), 0x6666_6666);
+    }
+
+    /// VLDR/VSTR .64 move the two words of a D register, low word first.
+    #[test]
+    fn vldr_vstr_d_register() {
+        let (mut c, mut bus) = core_and_bus();
+        let base = 0x2000_0400;
+        bus.write32(base + 8, 0xAAAA_0001, 0);
+        bus.write32(base + 12, 0xBBBB_0002, 0);
+        bus.write32(base - 8, 0xCCCC_0003, 0);
+        bus.write32(base - 4, 0xDDDD_0004, 0);
+        c.set_reg(0, base);
+        c.execute_one_wide_with_bus(0xED90, 0x1B02, &mut bus); // vldr d1, [r0, #8]
+        assert_eq!((c.regs.s[2].to_bits(), c.regs.s[3].to_bits()), (0xAAAA_0001, 0xBBBB_0002));
+        c.execute_one_wide_with_bus(0xED10, 0x1B02, &mut bus); // vldr d1, [r0, #-8]
+        assert_eq!((c.regs.s[2].to_bits(), c.regs.s[3].to_bits()), (0xCCCC_0003, 0xDDDD_0004));
+        c.regs.s[4] = f32::from_bits(0x0102_0304);
+        c.regs.s[5] = f32::from_bits(0x0506_0708);
+        c.execute_one_wide_with_bus(0xED80, 0x2B04, &mut bus); // vstr d2, [r0, #16]
+        assert_eq!((bus.read32(base + 16, 0), bus.read32(base + 20, 0)), (0x0102_0304, 0x0506_0708));
+        assert_eq!(c.reg(0), base, "no writeback");
+    }
+
+    /// VPUSH/VPOP {d8, d9} and VLDMIA/VSTMDB with writeback.
+    #[test]
+    fn vpush_vpop_and_multiple_d_registers() {
+        let (mut c, mut bus) = core_and_bus();
+        let sp = 0x2000_0800;
+        c.regs.msp = sp;
+        c.set_reg(13, sp);
+        for i in 16..20 {
+            c.regs.s[i] = f32::from_bits(0x1000 + i as u32);
+        }
+        c.execute_one_wide_with_bus(0xED2D, 0x8B04, &mut bus); // vpush {d8, d9}
+        assert_eq!(c.reg(13), sp - 16);
+        for i in 0..4 {
+            assert_eq!(bus.read32(sp - 16 + 4 * i, 0), 0x1010 + i);
+        }
+        for i in 16..20 {
+            c.regs.s[i] = f32::from_bits(0);
+        }
+        c.execute_one_wide_with_bus(0xECBD, 0x8B04, &mut bus); // vpop {d8, d9}
+        assert_eq!(c.reg(13), sp);
+        assert_eq!(c.regs.s[19].to_bits(), 0x1013);
+
+        let base = 0x2000_0900;
+        for i in 0..6 {
+            bus.write32(base + 4 * i, 0x9000 + i, 0);
+        }
+        c.set_reg(0, base);
+        c.execute_one_wide_with_bus(0xECB0, 0x1B06, &mut bus); // vldmia r0!, {d1-d3}
+        assert_eq!(c.reg(0), base + 24);
+        assert_eq!((c.regs.s[2].to_bits(), c.regs.s[7].to_bits()), (0x9000, 0x9005));
+        c.execute_one_wide_with_bus(0xED20, 0x1B06, &mut bus); // vstmdb r0!, {d1-d3}
+        assert_eq!(c.reg(0), base);
+    }
+
+    /// Double-precision arithmetic stays undefined on the SP-only FPU.
+    #[test]
+    fn double_arithmetic_is_still_undefined() {
+        let (mut c, mut bus) = core_and_bus();
+        // vadd.f64 d0, d1, d2 = ee31 0b02
+        c.execute_one_wide_with_bus(0xEE31, 0x0B02, &mut bus);
+        assert!(c.pending_fault.is_some());
+    }
 }
