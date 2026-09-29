@@ -1153,8 +1153,11 @@ impl Emulator {
                 for i in 0..2 {
                     // WFE wake: event flag clears WFE sleep. Consume
                     // (AcqRel swap to false) pairs with `sev_both`'s
-                    // Release.
-                    if self.bus.atomics.is_wfe_waiting(i) && self.bus.atomics.event_flag_consume(i)
+                    // Release. A pending exception that would preempt is
+                    // an ARMv8-M wake-up event too; it leaves the flag.
+                    if self.bus.atomics.is_wfe_waiting(i)
+                        && (self.bus.atomics.event_flag_consume(i)
+                            || arm[i].wfe_wakeup_pending(self.bus.atomics.irq_pending_load(i)))
                     {
                         self.bus.atomics.clear_wfe_waiting(i);
                     }
@@ -2411,6 +2414,57 @@ mod stage5_lib_residue {
         let _ = emu.step().unwrap();
         // wake_checks should have cleared wfe_waiting after consuming the flag.
         assert!(!emu.bus.atomics.is_wfe_waiting(0));
+    }
+
+    /// Core 0 parked in WFE (thread mode, `wfe; b .` at 0x2000_0000) with
+    /// NVIC line 3 enabled and its vector at a `b .` stub.
+    fn emu_parked_in_wfe() -> Emulator {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.memory.sram_write16(0, 0xBF20); // wfe
+        emu.bus.memory.sram_write16(2, 0xE7FE); // b .
+        emu.bus.memory.sram_write16(0x100, 0xE7FE); // IRQ 3 handler: b .
+        emu.bus.memory.sram_write32(0x200 + 4 * (16 + 3), 0x2000_0101);
+        emu.core_mut(1).halt();
+        let c = emu.core_mut(0);
+        c.ppb.vtor = 0x2000_0200;
+        c.regs.msp = 0x2000_1000;
+        c.regs.r[13] = 0x2000_1000;
+        c.regs.set_pc(0x2000_0000);
+        emu.mmio_write32(0xE000_E100, 1 << 3); // NVIC_ISER0
+        emu.step().unwrap();
+        assert!(emu.bus.atomics.is_wfe_waiting(0));
+        emu
+    }
+
+    /// ARMv8-M: an interrupt that would preempt is a WFE wake-up event —
+    /// embassy's thread executor sleeps in WFE and relies on its timer
+    /// interrupt to wake it. The event flag is left alone.
+    #[test]
+    fn wfe_wakes_on_a_preempting_interrupt() {
+        let mut emu = emu_parked_in_wfe();
+        emu.bus.assert_irq_shared(3);
+        emu.step().unwrap();
+        assert!(!emu.bus.atomics.is_wfe_waiting(0), "woken by IRQ 3");
+        assert!(!emu.bus.atomics.event_flag_load(0));
+        emu.step().unwrap();
+        assert_eq!(emu.core(0).regs.ipsr(), 16 + 3, "the IRQ is then taken");
+    }
+
+    /// Masked or disabled interrupts are no wake-up event.
+    #[test]
+    fn wfe_stays_asleep_for_interrupts_that_cannot_preempt() {
+        let mut emu = emu_parked_in_wfe();
+        emu.core_mut(0).regs.primask = 1;
+        emu.bus.assert_irq_shared(3);
+        emu.step().unwrap();
+        emu.step().unwrap();
+        assert!(emu.bus.atomics.is_wfe_waiting(0), "PRIMASK masks IRQ 3");
+
+        let mut emu = emu_parked_in_wfe();
+        emu.bus.assert_irq_shared(4); // pending but not enabled
+        emu.step().unwrap();
+        emu.step().unwrap();
+        assert!(emu.bus.atomics.is_wfe_waiting(0), "IRQ 4 is disabled");
     }
 
     /// Drives the true branch of `if self.bus.atomics.is_halted(i)`

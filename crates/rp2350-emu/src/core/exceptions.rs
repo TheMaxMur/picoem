@@ -568,6 +568,37 @@ impl CortexM33 {
         exc_prio < self.execution_priority()
     }
 
+    /// ARMv8-M WFE wake-up event from the exception side: a pending
+    /// exception that would preempt the current execution priority — the
+    /// same arbitration `try_take_any_pending_exception` applies, without
+    /// taking anything. `unmerged` is the peripheral pend mask not yet
+    /// folded into NVIC_ISPR (`CoreAtomics::irq_pending`). SEVONPEND
+    /// (wake on any new pend) is not modelled.
+    pub(crate) fn wfe_wakeup_pending(&self, unmerged: u64) -> bool {
+        use crate::bus::ppb::{ICSR_NMIPENDSET, ICSR_PENDSTSET, ICSR_PENDSVSET, NVIC_BIT_WORDS};
+        let icsr = self.ppb.icsr;
+        if icsr & ICSR_NMIPENDSET != 0 {
+            return true;
+        }
+        let exec = self.execution_priority();
+        let preempts = |exc: u16| self.ppb.exception_priority(exc) < exec;
+        if (icsr & ICSR_PENDSVSET != 0 && preempts(14)) || (icsr & ICSR_PENDSTSET != 0 && preempts(15)) {
+            return true;
+        }
+        (0..NVIC_BIT_WORDS).any(|w| {
+            let pending = self.ppb.nvic_ispr[w].load(Ordering::Relaxed) | (unmerged >> (32 * w)) as u32;
+            let mut ready = self.ppb.nvic_iser[w].load(Ordering::Relaxed) & pending;
+            while ready != 0 {
+                let irq = w as u16 * 32 + ready.trailing_zeros() as u16;
+                if preempts(irq + 16) {
+                    return true;
+                }
+                ready &= ready - 1;
+            }
+            false
+        })
+    }
+
     /// Attempt to take the highest-priority pending exception at this
     /// instruction boundary, unified across NMI, PendSV, SysTick, and
     /// external NVIC IRQs. ARMv8-M §B3.7 mandates a single priority
