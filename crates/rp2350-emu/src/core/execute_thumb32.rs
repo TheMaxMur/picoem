@@ -876,6 +876,15 @@ impl CortexM33 {
             self.exclusive_address = None;
             return 2;
         }
+        // Load-acquire / store-release (ARMv8-M): see
+        // `thumb32_acquire_release`. Must precede the LDRD/STRD fallback,
+        // which would otherwise read `hw1[11:8] = 0b1111` as Rt2 = PC.
+        if hw0 & 0xFFE0 == 0xE8C0
+            && (hw1 >> 8) & 0xF == 0xF
+            && matches!((hw1 >> 4) & 0xF, 0x8 | 0x9 | 0xA | 0xC | 0xD | 0xE)
+        {
+            return self.thumb32_acquire_release(hw0, hw1, bus);
+        }
         // (Falls through to LDRD/STRD for any other unrecognized pattern)
 
         // LDRD/STRD (immediate): default path
@@ -916,6 +925,57 @@ impl CortexM33 {
         }
 
         3 // M33 measured: 3 cycles (two word transfers)
+    }
+
+    /// LDA / LDAB / LDAH, LDAEX / LDAEXB / LDAEXH, STL / STLB / STLH and
+    /// STLEX / STLEXB / STLEXH (ARMv8-M Mainline), all addressing `[Rn]`
+    /// with no offset (encodings cross-checked against LLVM's assembler):
+    ///
+    /// ```text
+    /// hw0 = 1110_1000_110L_Rn      L: 1 load-acquire, 0 store-release
+    /// hw1 = Rt_1111_op3_xxxx       op3: 1000 B, 1001 H, 1010 W (plain)
+    ///                                   1100 B, 1101 H, 1110 W (exclusive)
+    ///                              xxxx: Rd for STLEX*, 0b1111 otherwise
+    /// ```
+    ///
+    /// The Serial model executes accesses in program order, so acquire /
+    /// release ordering needs nothing beyond the access itself. The
+    /// exclusive forms share the LDREX*/STREX* address monitor (keyed on
+    /// the word, as LDREXB/LDREXH are).
+    fn thumb32_acquire_release<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
+        let load = hw0 & (1 << 4) != 0;
+        let rn = (hw0 & 0xF) as usize;
+        let rt = ((hw1 >> 12) & 0xF) as usize;
+        let op3 = (hw1 >> 4) & 0xF;
+        let exclusive = op3 & 0x4 != 0;
+        let addr = self.regs.r[rn];
+        if load {
+            self.regs.r[rt] = match op3 & 0x3 {
+                0 => self.bus_read8(addr, bus) as u32,
+                1 => self.bus_read16(addr, bus) as u32,
+                _ => self.bus_read32(addr, bus),
+            };
+            if exclusive {
+                self.exclusive_address = Some(addr & !3);
+            }
+            return 2;
+        }
+        let value = self.regs.r[rt];
+        if exclusive {
+            let rd = (hw1 & 0xF) as usize;
+            let granted = self.exclusive_address == Some(addr & !3);
+            self.exclusive_address = None;
+            self.regs.r[rd] = if granted { 0 } else { 1 };
+            if !granted {
+                return 2;
+            }
+        }
+        match op3 & 0x3 {
+            0 => self.bus_write8(addr, value as u8, bus),
+            1 => self.bus_write16(addr, value as u16, bus),
+            _ => self.bus_write32(addr, value, bus),
+        }
+        2
     }
 
     // -- Branches and miscellaneous control ----------------------------------

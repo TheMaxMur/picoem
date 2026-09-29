@@ -1065,6 +1065,109 @@ mod load_store_dual_and_exclusive {
         // Post-index: stored at base, then R2 += 16.
         assert_eq!(c.reg(2), 0x2000_0090);
     }
+
+    // ARMv8-M load-acquire / store-release. Encodings are
+    // `llvm-mc -triple=thumbv8m.main-none-eabi -show-encoding` output
+    // for Rt = r1, Rn = r2 (Rd = r3 for STLEX*).
+    const LDA: (u16, u16) = (0xE8D2, 0x1FAF);
+    const LDAB: (u16, u16) = (0xE8D2, 0x1F8F);
+    const LDAH: (u16, u16) = (0xE8D2, 0x1F9F);
+    const LDAEX: (u16, u16) = (0xE8D2, 0x1FEF);
+    const LDAEXB: (u16, u16) = (0xE8D2, 0x1FCF);
+    const LDAEXH: (u16, u16) = (0xE8D2, 0x1FDF);
+    const STL: (u16, u16) = (0xE8C2, 0x1FAF);
+    const STLB: (u16, u16) = (0xE8C2, 0x1F8F);
+    const STLH: (u16, u16) = (0xE8C2, 0x1F9F);
+    const STLEX: (u16, u16) = (0xE8C2, 0x1FE3);
+    const STLEXB: (u16, u16) = (0xE8C2, 0x1FC3);
+    const STLEXH: (u16, u16) = (0xE8C2, 0x1FD3);
+
+    /// LDA/LDAB/LDAH load zero-extended from `[Rn]`. Before these were
+    /// decoded they fell through to LDRD and loaded PC from `[Rn + 4]`.
+    #[test]
+    fn load_acquire_widths() {
+        let (mut c, mut bus) = core_and_bus();
+        let a = 0x2000_0100;
+        bus.write32(a, 0x8899_AABB, 0);
+        bus.write32(a + 4, 0xFFFF_FFFF, 0);
+        c.set_reg(2, a);
+        c.regs.set_pc(0x2000_1000);
+        for ((hw0, hw1), want) in [(LDA, 0x8899_AABB), (LDAB, 0xBB), (LDAH, 0xAABB)] {
+            c.set_reg(1, 0x5555_5555);
+            c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+            assert_eq!(c.reg(1), want, "{hw0:#06x} {hw1:#06x}");
+        }
+        assert_eq!(c.regs.pc(), 0x2000_100C, "no PC load, no branch");
+        assert!(c.exclusive_address.is_none(), "plain LDA opens no monitor");
+    }
+
+    /// STL/STLB/STLH store the low bytes of Rt to `[Rn]` only.
+    #[test]
+    fn store_release_widths() {
+        let (mut c, mut bus) = core_and_bus();
+        let a = 0x2000_0200;
+        c.set_reg(2, a);
+        c.set_reg(1, 0x1122_3344);
+        for ((hw0, hw1), want) in [
+            (STLB, 0xFFFF_FF44u32),
+            (STLH, 0xFFFF_3344),
+            (STL, 0x1122_3344),
+        ] {
+            bus.write32(a, 0xFFFF_FFFF, 0);
+            bus.write32(a + 4, 0xFFFF_FFFF, 0);
+            c.execute_one_wide_with_bus(hw0, hw1, &mut bus);
+            assert_eq!(bus.read32(a, 0), want, "{hw0:#06x} {hw1:#06x}");
+            assert_eq!(bus.read32(a + 4, 0), 0xFFFF_FFFF, "nothing past the access");
+        }
+    }
+
+    /// LDAEX*/STLEX* pairs: the store lands and reports 0 while the
+    /// monitor is open, then reports 1 and stores nothing once it closed.
+    #[test]
+    fn acquire_release_exclusive_pairs() {
+        for (ld, st, width) in [(LDAEX, STLEX, 4u32), (LDAEXH, STLEXH, 2), (LDAEXB, STLEXB, 1)] {
+            let (mut c, mut bus) = core_and_bus();
+            let a = 0x2000_0300;
+            let mask = if width == 4 { u32::MAX } else { (1u32 << (width * 8)) - 1 };
+            bus.write32(a, 0xA1B2_C3D4, 0);
+            c.set_reg(2, a);
+            c.execute_one_wide_with_bus(ld.0, ld.1, &mut bus);
+            assert_eq!(c.reg(1), 0xA1B2_C3D4 & mask);
+            assert_eq!(c.exclusive_address, Some(a));
+
+            c.set_reg(1, 0x0F0F_0F0F);
+            c.execute_one_wide_with_bus(st.0, st.1, &mut bus);
+            assert_eq!(c.reg(3), 0, "width {width}: monitor open, store succeeds");
+            assert_eq!(bus.read32(a, 0) & mask, 0x0F0F_0F0F & mask);
+            assert!(c.exclusive_address.is_none());
+
+            c.set_reg(1, 0x7777_7777);
+            c.execute_one_wide_with_bus(st.0, st.1, &mut bus);
+            assert_eq!(c.reg(3), 1, "width {width}: monitor closed, store fails");
+            assert_eq!(bus.read32(a, 0) & mask, 0x0F0F_0F0F & mask);
+        }
+    }
+
+    /// The exclusive forms share LDREX's monitor: an LDREX-opened monitor
+    /// grants STLEX, and an LDAEX-opened one grants STREX.
+    #[test]
+    fn acquire_release_share_the_ldrex_monitor() {
+        let (mut c, mut bus) = core_and_bus();
+        let a = 0x2000_0400;
+        c.set_reg(2, a);
+        c.exclusive_address = Some(a);
+        c.set_reg(1, 0xCAFE);
+        c.execute_one_wide_with_bus(STLEX.0, STLEX.1, &mut bus);
+        assert_eq!(c.reg(3), 0);
+        assert_eq!(bus.read32(a, 0), 0xCAFE);
+
+        c.execute_one_wide_with_bus(LDAEX.0, LDAEX.1, &mut bus);
+        c.set_reg(4, 0xBEEF);
+        // STREX R3, R4, [R2, #0]
+        c.execute_one_wide_with_bus(0xE840 | 2, (4 << 12) | (3 << 8), &mut bus);
+        assert_eq!(c.reg(3), 0);
+        assert_eq!(bus.read32(a, 0), 0xBEEF);
+    }
 }
 
 // ===========================================================================
