@@ -146,6 +146,7 @@ mod pio_tests;
 #[cfg(test)]
 mod tests_narrow;
 
+pub use self::bootrom_hooks::{RomCall, RomHookError};
 pub use self::bus::Bus;
 pub use self::bus::mmio_device::{MmioAliasing, MmioCtx, MmioDevice, MmioHandle, MountError};
 pub use self::core::CoreCounters;
@@ -409,6 +410,10 @@ pub struct Emulator {
     /// `run_quantum`'s post-step path. Soft-reboot scenarios that need
     /// to re-init must rebuild the emulator from scratch.
     pub shutdown_requested: bool,
+    /// Codes installed by [`Self::hook_rom_call`], re-resolved against
+    /// the ROM whenever [`Self::reset`] / [`Self::load_bootrom`] rebuild
+    /// the cores' hook lists.
+    rom_call_codes: Vec<[u8; 2]>,
 }
 
 impl Emulator {
@@ -465,14 +470,11 @@ impl Emulator {
         // `CortexM33::new` clears the fields, so re-resolve here from
         // the live `Memory` so the hook survives `reset`. HLD V5
         // §"Component 3 — Soft-reboot / reload".
-        let (hook_s, hook_ns) = {
-            // Read the first 32 KB of ROM into a scratch buffer; the
-            // resolver only needs offsets 0x14 and ≥0x7cd4.
-            let mut rom_bytes = vec![0u8; crate::memory::ROM_SIZE];
-            for (i, b) in rom_bytes.iter_mut().enumerate() {
-                *b = self.bus.memory.rom_read8(i as u32);
-            }
-            bootrom_hooks::resolve_bootrom_hooks(&rom_bytes, b"RB")
+        let (hook_s, hook_ns, rom_call_hooks) = {
+            let rom_bytes = self.rom_image();
+            let (s, ns) = bootrom_hooks::resolve_bootrom_hooks(&rom_bytes, b"RB");
+            let calls = bootrom_hooks::resolve_rom_call_hooks(&rom_bytes, &self.rom_call_codes);
+            (s, ns, calls)
         };
         match &mut self.cores {
             Cores::Arm(arm) => {
@@ -484,6 +486,7 @@ impl Emulator {
                     arm[i].regs.xpsr = 1 << 24; // Thumb bit (XPSR_T)
                     arm[i].bootrom_reboot_hook_pc_s = hook_s;
                     arm[i].bootrom_reboot_hook_pc_ns = hook_ns;
+                    arm[i].rom_call_hooks = rom_call_hooks.clone();
                 }
             }
             Cores::RiscV(cs) => {
@@ -622,10 +625,12 @@ impl Emulator {
             // resolving from it directly avoids a redundant memory
             // re-read.
             let (s, ns) = bootrom_hooks::resolve_bootrom_hooks(data, b"RB");
+            let calls = bootrom_hooks::resolve_rom_call_hooks(data, &self.rom_call_codes);
             for core in arm.iter_mut() {
                 core.invalidate_decode_cache_regions(regions);
                 core.bootrom_reboot_hook_pc_s = s;
                 core.bootrom_reboot_hook_pc_ns = ns;
+                core.rom_call_hooks = calls.clone();
             }
         }
         self.bus.pending_invalidation_regions = 0;
@@ -1030,6 +1035,8 @@ impl Emulator {
             pending_panic_inject: None,
             bus_is_placeholder: false,
             shutdown_requested: self.shutdown_requested,
+            // `hook_rom_call` refuses a Threaded emulator: nothing to carry.
+            rom_call_codes: Vec::new(),
         };
         self.threaded = Some(threaded::ThreadedEmulator::from_emulator(seeded));
         // Mark the flat fields as dead state — they now hold
@@ -1154,7 +1161,9 @@ impl Emulator {
                     // WFI wake: enabled pending IRQ clears WFI sleep.
                     // The peek is non-consuming; the next step() will
                     // merge via `take_irq_pending`.
-                    if self.bus.atomics.is_halted(i) {
+                    // A core parked on a hooked ROM call waits for the host
+                    // (`return_from_rom_call`), not for an interrupt.
+                    if self.bus.atomics.is_halted(i) && arm[i].rom_call_pending.is_none() {
                         let pending = self.bus.atomics.irq_pending_load(i);
                         if pending != 0 && arm[i].ppb.any_pending_enabled(pending) {
                             self.bus.atomics.clear_halted(i);
@@ -1423,6 +1432,87 @@ impl Emulator {
         }
         self.bus.mount_mmio(base, size, aliasing, device)
     }
+
+    /// Stop any Arm core that reaches bootrom function `code` (a
+    /// `rom_func_table` code such as `*b"RE"`) at its entry — Secure or
+    /// Non-Secure alias — so the host can service the call; see
+    /// [`Self::pending_rom_call`] and [`Self::return_from_rom_call`].
+    /// Resolved against the loaded bootrom now and again on every
+    /// [`Self::reset`] / [`Self::load_bootrom`]. Idempotent.
+    pub fn hook_rom_call(&mut self, code: [u8; 2]) -> Result<(), RomHookError> {
+        if self.execution_model == ExecutionModel::Threaded || !self.cores.is_arm() {
+            return Err(RomHookError::Unsupported);
+        }
+        if &code == b"RB" {
+            return Err(RomHookError::Reserved);
+        }
+        let hooks = bootrom_hooks::resolve_rom_call_hooks(&self.rom_image(), &[code]);
+        if hooks.is_empty() {
+            return Err(RomHookError::NotInRomTable);
+        }
+        if !self.rom_call_codes.contains(&code) {
+            self.rom_call_codes.push(code);
+            for core in self.cores.expect_arm_mut() {
+                core.rom_call_hooks.extend_from_slice(&hooks);
+            }
+        }
+        Ok(())
+    }
+
+    /// The hooked ROM call a core is stopped at (lowest core first), if
+    /// any. Check after each [`Self::step`]: the calling core stays halted
+    /// until [`Self::return_from_rom_call`], while the other core and the
+    /// peripherals keep running.
+    pub fn pending_rom_call(&self) -> Option<RomCall> {
+        let Cores::Arm(arm) = &self.cores else {
+            return None;
+        };
+        arm.iter().enumerate().find_map(|(core, c)| {
+            let r = &c.regs.r;
+            c.rom_call_pending.map(|code| RomCall {
+                core,
+                code,
+                args: [r[0], r[1], r[2], r[3]],
+            })
+        })
+    }
+
+    /// Finish the hooked call `core` is stopped at the way the ROM
+    /// function's own `BX LR` would: `r0` takes the result when given,
+    /// PC = LR (an `EXC_RETURN` in LR performs the exception return), and
+    /// the core resumes. Returns `false`, changing nothing, when `core`
+    /// has no pending call.
+    pub fn return_from_rom_call(&mut self, core: usize, r0: Option<u32>) -> bool {
+        let Cores::Arm(arm) = &mut self.cores else {
+            return false;
+        };
+        let Some(c) = arm.get_mut(core) else {
+            return false;
+        };
+        if c.rom_call_pending.take().is_none() {
+            return false;
+        }
+        if let Some(v) = r0 {
+            c.regs.r[0] = v;
+        }
+        let lr = c.regs.lr();
+        let cost = if CortexM33::is_exc_return(lr) {
+            c.exit_exception(lr, &mut self.bus)
+        } else {
+            c.regs.set_pc(lr & !1);
+            1
+        };
+        c.cycles = c.cycles.wrapping_add(cost as u64);
+        c.wake();
+        true
+    }
+
+    /// Scratch copy of the loaded bootrom for the hook resolvers.
+    fn rom_image(&self) -> Vec<u8> {
+        (0..crate::memory::ROM_SIZE as u32)
+            .map(|i| self.bus.memory.rom_read8(i))
+            .collect()
+    }
 }
 
 /// Advance both Arm cores up to `target` cycles. Mirrors the original
@@ -1668,6 +1758,7 @@ impl EmulatorBuilder {
             ))]
             bus_is_placeholder: false,
             shutdown_requested: false,
+            rom_call_codes: Vec::new(),
         };
         Ok(emu)
     }

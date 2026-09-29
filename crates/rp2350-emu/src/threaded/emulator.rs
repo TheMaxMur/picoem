@@ -140,6 +140,7 @@ impl ThreadedEmulator {
                 pending_panic_inject: _,
             bus_is_placeholder: _,
             shutdown_requested,
+            rom_call_codes: _,
         } = emu;
         // ThreadedEmulator currently only supports the Arm arm — RISC-V
         // (Hazard3) lives behind the P1a enum but doesn't thread yet.

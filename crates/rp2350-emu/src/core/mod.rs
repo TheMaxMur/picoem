@@ -356,7 +356,22 @@ pub struct CortexM33 {
     /// `decode_execute`. Terminate-only contract — never cleared by the
     /// core itself.
     pub bootrom_hook_fired: bool,
+    /// Host-serviced ROM-call hooks as `(entry pc, code)` pairs, one per
+    /// Secure entry and its Non-Secure alias. Seeded by
+    /// [`crate::Emulator::hook_rom_call`]; every PC is below
+    /// [`ROM_HOOK_PC_END`].
+    pub rom_call_hooks: Vec<(u32, [u8; 2])>,
+    /// Code of the hooked ROM function this core stopped at, if any.
+    /// While set the core stays halted (no WFI-style wake); the host
+    /// services the call and resumes it with
+    /// [`crate::Emulator::return_from_rom_call`].
+    pub rom_call_pending: Option<[u8; 2]>,
 }
+
+/// Every ROM hook PC lies below this address: the 32 KB bootrom at
+/// `0x0000_0000` plus its Non-Secure alias at `0x0000_8000`. The step
+/// path compares against it once before looking at any hook.
+pub const ROM_HOOK_PC_END: u32 = 0x0001_0000;
 
 impl CortexM33 {
     /// Construct a core with the given core id and shared atomics.
@@ -393,6 +408,8 @@ impl CortexM33 {
             bootrom_reboot_hook_pc_s: None,
             bootrom_reboot_hook_pc_ns: None,
             bootrom_hook_fired: false,
+            rom_call_hooks: Vec::new(),
+            rom_call_pending: None,
         }
     }
 
@@ -466,6 +483,11 @@ impl CortexM33 {
         if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
             self.bootrom_hook_fired = true;
             self.atomics.set_halted(core);
+            return;
+        }
+        // Host-serviced ROM-call hooks: every hook PC is a ROM entry, so
+        // code running anywhere else pays this one compare.
+        if pc < ROM_HOOK_PC_END && self.rom_call_hook_hit(pc) {
             return;
         }
 
@@ -554,6 +576,9 @@ impl CortexM33 {
             self.atomics.set_halted(self.core_id as usize);
             return;
         }
+        if pc < ROM_HOOK_PC_END && self.rom_call_hook_hit(pc) {
+            return;
+        }
 
         let mut cycles = self.decode_execute(bus);
 
@@ -597,6 +622,19 @@ impl CortexM33 {
     /// the quantum scheduler and by DWT CYCCNT (Stage 2).
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+
+    /// Host-serviced ROM-call hook check at an instruction boundary;
+    /// `pc` is below [`ROM_HOOK_PC_END`]. On a hit the core records
+    /// [`Self::rom_call_pending`] and halts without dispatching the
+    /// instruction, for [`crate::Emulator::return_from_rom_call`].
+    fn rom_call_hook_hit(&mut self, pc: u32) -> bool {
+        let Some(&(_, code)) = self.rom_call_hooks.iter().find(|(hook, _)| *hook == pc) else {
+            return false;
+        };
+        self.rom_call_pending = Some(code);
+        self.atomics.set_halted(self.core_id as usize);
+        true
     }
 
     /// Invalidate this core's decode-cache entries for the supplied

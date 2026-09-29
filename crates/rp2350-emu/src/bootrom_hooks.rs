@@ -123,6 +123,57 @@ pub fn resolve_bootrom_hooks(bootrom: &[u8], code: &[u8; 2]) -> (Option<u32>, Op
     (s, ns)
 }
 
+/// Resolves each code to `(pc, code)` pairs — its Secure entry PC and
+/// the Non-Secure alias — in the form [`crate::CortexM33::rom_call_hooks`]
+/// holds. Codes without an ARM_SEC entry in `bootrom` are skipped.
+pub fn resolve_rom_call_hooks(bootrom: &[u8], codes: &[[u8; 2]]) -> Vec<(u32, [u8; 2])> {
+    codes
+        .iter()
+        .flat_map(|code| {
+            let (s, ns) = resolve_bootrom_hooks(bootrom, code);
+            [s, ns].into_iter().flatten().map(move |pc| (pc, *code))
+        })
+        .collect()
+}
+
+/// A bootrom function call a hooked core stopped at, as reported by
+/// [`crate::Emulator::pending_rom_call`]. The core sits halted at the
+/// function's entry with the AAPCS argument registers intact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RomCall {
+    /// Core that made the call (0 or 1).
+    pub core: usize,
+    /// The function's two-character `rom_func_table` code, e.g. `*b"RE"`.
+    pub code: [u8; 2],
+    /// `r0..=r3` at the call.
+    pub args: [u32; 4],
+}
+
+/// Why [`crate::Emulator::hook_rom_call`] refused a code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RomHookError {
+    /// The loaded bootrom has no ARM_SEC entry for the code.
+    NotInRomTable,
+    /// `RB` is the built-in terminate-only reboot hook
+    /// (`Emulator::shutdown_requested`).
+    Reserved,
+    /// Only a Serial, Arm emulator surfaces hooked calls to the host.
+    Unsupported,
+}
+
+impl std::fmt::Display for RomHookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            RomHookError::NotInRomTable => "the loaded bootrom has no ARM_SEC entry for this code",
+            RomHookError::Reserved => "RB is the built-in terminate-only reboot hook",
+            RomHookError::Unsupported => "ROM-call hooks need a Serial, Arm emulator",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for RomHookError {}
+
 #[inline]
 fn read_u16(bytes: &[u8], off: usize) -> Option<u16> {
     bytes
@@ -426,5 +477,161 @@ mod tests {
             emu.cores.expect_arm()[0].bootrom_reboot_hook_pc_s,
             Some(original_s)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Host-serviced ROM-call hooks (`Emulator::hook_rom_call`).
+    // ------------------------------------------------------------------
+
+    /// SRAM address of a `b .` the tests return into.
+    const LOOP: u32 = 0x2000_0100;
+
+    fn emu_with_hooked(code: &[u8; 2]) -> Emulator {
+        let mut emu = Emulator::new(Config::default());
+        emu.load_bootrom(&pinned_bootrom());
+        emu.reset();
+        emu.cores.expect_arm_mut()[1].halt();
+        emu.bus.memory.sram_write16(LOOP & 0xFFFF, 0xE7FE);
+        emu.hook_rom_call(*code).unwrap();
+        emu
+    }
+
+    /// Park core 0 at `code`'s Secure entry as a `BLX` from SRAM would.
+    fn call_hooked(emu: &mut Emulator, code: &[u8; 2], args: [u32; 4]) {
+        let entry = resolve_rom_func(&pinned_bootrom(), code).unwrap();
+        let c = &mut emu.cores.expect_arm_mut()[0];
+        c.regs.r[..4].copy_from_slice(&args);
+        c.regs.set_lr(LOOP | 1);
+        c.regs.set_pc(entry);
+        c.wake();
+    }
+
+    #[test]
+    fn hooked_rom_call_round_trip() {
+        let mut emu = emu_with_hooked(b"RE");
+        call_hooked(&mut emu, b"RE", [0x1000, 0x2000, 1 << 31, 0]);
+        emu.step().unwrap();
+        let call = emu.pending_rom_call().expect("the hook must stop the core");
+        assert_eq!(
+            call,
+            RomCall {
+                core: 0,
+                code: *b"RE",
+                args: [0x1000, 0x2000, 1 << 31, 0]
+            }
+        );
+        assert!(emu.cores.expect_arm()[0].is_halted());
+        assert!(!emu.shutdown_requested, "only RB terminates");
+        // Nothing moves until the host answers.
+        emu.step().unwrap();
+        assert_eq!(emu.pending_rom_call(), Some(call));
+
+        assert!(emu.return_from_rom_call(0, Some(0xABCD)));
+        let c = &emu.cores.expect_arm()[0];
+        assert_eq!(c.regs.r[0], 0xABCD);
+        assert_eq!(c.regs.pc(), LOOP);
+        assert!(!c.is_halted());
+        assert_eq!(emu.pending_rom_call(), None);
+        emu.step().unwrap();
+        assert_eq!(emu.cores.expect_arm()[0].regs.pc(), LOOP);
+        assert!(!emu.return_from_rom_call(0, None), "no call left to finish");
+    }
+
+    /// A genuine call path: firmware asks the ROM's own `rom_table_lookup`
+    /// (halfword pointer at 0x16) for `RE`, then `BLX`es the result. The
+    /// hook must fire on the entry the ROM hands out, and the return must
+    /// land after the `BLX`.
+    #[test]
+    fn hook_catches_a_call_through_the_rom_lookup() {
+        let mut emu = emu_with_hooked(b"RE");
+        // blx r2; mov r4, r0; movs r0, #1; movs r1, #2; blx r4; b .
+        let prog: [u16; 6] = [0x4790, 0x4604, 0x2001, 0x2102, 0x47A0, 0xE7FE];
+        for (i, hw) in prog.iter().enumerate() {
+            emu.bus.memory.sram_write16((i * 2) as u32, *hw);
+        }
+        let lookup = emu.bus.memory.rom_read16(0x16) as u32;
+        let c = &mut emu.cores.expect_arm_mut()[0];
+        // Post-boot state a direct boot must supply: the bootrom leaves
+        // CP7 (RCP) enabled, and every public ROM function, the lookup
+        // included, opens with an RCP canary.
+        c.ppb.cpacr |= 0x3 << 14;
+        c.regs.r[0] = u16::from_le_bytes(*b"RE") as u32;
+        c.regs.r[1] = 0x0004; // RT_FLAG_FUNC_ARM_SEC
+        c.regs.r[2] = lookup;
+        c.regs.msp = 0x2000_2000;
+        c.regs.r[13] = 0x2000_2000;
+        c.regs.set_pc(0x2000_0000);
+        c.wake();
+        let mut call = None;
+        for _ in 0..64 {
+            emu.step().unwrap();
+            call = emu.pending_rom_call();
+            if call.is_some() {
+                break;
+            }
+        }
+        let call = call.expect("the lookup's answer must be the hooked entry");
+        assert_eq!((call.code, call.args[0], call.args[1]), (*b"RE", 1, 2));
+        emu.return_from_rom_call(0, None);
+        emu.step().unwrap();
+        assert_eq!(emu.cores.expect_arm()[0].regs.pc(), 0x2000_000A);
+    }
+
+    #[test]
+    fn hooked_core_waits_for_the_host_not_an_interrupt() {
+        /// Holds IRQ 3 high from the quantum-end tick, where the wake
+        /// check sees it (a pend made between steps is merged into the
+        /// NVIC at the next quantum's start, before that check runs).
+        struct Irq3;
+        impl crate::MmioDevice for Irq3 {
+            fn read(&mut self, _: u32, _: u8, _: &mut crate::MmioCtx) -> u32 {
+                0
+            }
+            fn write(&mut self, _: u32, _: u32, _: u8, _: u32, _: &mut crate::MmioCtx) {}
+            fn tick(&mut self, _: u32, ctx: &mut crate::MmioCtx) {
+                ctx.raise_irqs |= 1 << 3;
+            }
+        }
+        let mut emu = emu_with_hooked(b"RE");
+        emu.mmio_write32(0xE000_E100, 1 << 3); // NVIC_ISER0: IRQ 3
+        emu.mount_mmio(0x4010_8000, 4, crate::MmioAliasing::Flat, Irq3)
+            .unwrap();
+        call_hooked(&mut emu, b"RE", [0; 4]);
+        // An enabled, pending IRQ wakes a WFI-halted core; it must not
+        // wake one parked on a hooked call.
+        for _ in 0..3 {
+            emu.step().unwrap();
+            assert!(emu.cores.expect_arm()[0].is_halted());
+        }
+        assert!(emu.pending_rom_call().is_some());
+    }
+
+    #[test]
+    fn rom_call_hooks_follow_reset_and_bootrom_reload() {
+        let mut emu = emu_with_hooked(b"RE");
+        let entry = resolve_rom_func(&pinned_bootrom(), b"RE").unwrap();
+        let expect = vec![(entry, *b"RE"), (entry + 0x8000, *b"RE")];
+        assert_eq!(emu.cores.expect_arm()[1].rom_call_hooks, expect);
+        emu.hook_rom_call(*b"RE").unwrap(); // idempotent
+        emu.reset();
+        assert_eq!(emu.cores.expect_arm()[0].rom_call_hooks, expect);
+        emu.load_bootrom(&vec![0u8; 32 * 1024]);
+        assert!(emu.cores.expect_arm()[0].rom_call_hooks.is_empty());
+        emu.load_bootrom(&pinned_bootrom());
+        assert_eq!(emu.cores.expect_arm()[0].rom_call_hooks, expect);
+    }
+
+    #[test]
+    fn hook_rom_call_refusals() {
+        let mut emu = Emulator::new(Config::default());
+        emu.load_bootrom(&pinned_bootrom());
+        assert_eq!(emu.hook_rom_call(*b"RB"), Err(RomHookError::Reserved));
+        assert_eq!(emu.hook_rom_call(*b"ZZ"), Err(RomHookError::NotInRomTable));
+        let mut rv = crate::EmulatorBuilder::new(Config::default())
+            .arch(crate::Arch::RiscV)
+            .build()
+            .unwrap();
+        rv.load_bootrom(&pinned_bootrom());
+        assert_eq!(rv.hook_rom_call(*b"RE"), Err(RomHookError::Unsupported));
     }
 }
