@@ -1412,6 +1412,18 @@ impl Bus {
         self.pending_invalidation_regions |= invalidation_regions::XIP;
     }
 
+    /// Overwrite `data` into the loaded flash at byte `offset`, in place
+    /// (see [`Memory::xip_write`]), for a host-side flash model applying
+    /// an erase or program. Sets the XIP bit in
+    /// [`Self::pending_invalidation_regions`] like [`Self::load_flash`], so
+    /// neither core executes a stale decoded op from the rewritten bytes.
+    /// Returns how many bytes landed inside the backing.
+    pub fn write_flash(&mut self, offset: u32, data: &[u8]) -> usize {
+        let n = self.memory.xip_write(offset, data);
+        self.pending_invalidation_regions |= invalidation_regions::XIP;
+        n
+    }
+
     // --- Latency accounting ---
 
     /// Returns the cycle cost of the most recent bus access.
@@ -3832,5 +3844,43 @@ mod bus_observability {
         assert!(bus.watchdog_reset_requested());
         bus.clear_watchdog_reset();
         assert!(!bus.watchdog_reset_requested());
+    }
+}
+
+#[cfg(test)]
+mod write_flash_tests {
+    use crate::{Config, Emulator};
+
+    /// Flash image: `movs r0, #1` then `b .` at 0x1000_0000.
+    fn emu_running_flash() -> Emulator {
+        let mut emu = Emulator::new(Config::default());
+        let mut image = vec![0xFFu8; 0x1000];
+        image[0..4].copy_from_slice(&[0x01, 0x20, 0xFE, 0xE7]);
+        emu.load_flash(&image);
+        emu.core_mut(1).halt();
+        emu.core_mut(0).regs.set_pc(0x1000_0000);
+        emu.step().unwrap();
+        assert_eq!(emu.core(0).regs.r[0], 1);
+        emu
+    }
+
+    #[test]
+    fn rewritten_flash_code_runs_the_new_instruction() {
+        let mut emu = emu_running_flash();
+        // Both ops are now in core 0's decode cache. Rewrite the first to
+        // `movs r0, #2` and re-enter it: a stale cache would replay #1.
+        assert_eq!(emu.bus.write_flash(0, &[0x02, 0x20]), 2);
+        emu.core_mut(0).regs.set_pc(0x1000_0000);
+        emu.step().unwrap();
+        assert_eq!(emu.core(0).regs.r[0], 2);
+        assert_eq!(emu.bus.memory.xip_read16(2), 0xE7FE, "neighbour untouched");
+    }
+
+    #[test]
+    fn write_flash_clamps_at_the_backing_and_keeps_its_size() {
+        let mut emu = emu_running_flash();
+        assert_eq!(emu.bus.write_flash(0xFFE, &[0xAA, 0xBB, 0xCC]), 2);
+        assert_eq!(emu.bus.memory.flash_size(), 0x1000);
+        assert_eq!(emu.bus.memory.xip_read16(0xFFE), 0xBBAA);
     }
 }

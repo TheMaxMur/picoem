@@ -166,6 +166,20 @@ impl Memory {
         }
     }
 
+    /// Overwrite flash bytes in place, starting at byte `offset` of the
+    /// XIP backing. Unlike [`Self::load_flash`] the rest of the backing is
+    /// untouched and its size never changes: bytes that would land past
+    /// the end are dropped. Returns how many bytes were written.
+    ///
+    /// Raw storage only — no NOR erase/program semantics. Callers that
+    /// model a flash part apply those before calling this.
+    pub fn xip_write(&mut self, offset: u32, data: &[u8]) -> usize {
+        let start = (offset as usize).min(self.xip.len());
+        let n = data.len().min(self.xip.len() - start);
+        self.xip[start..start + n].copy_from_slice(&data[..n]);
+        n
+    }
+
     pub fn xip_read8(&self, offset: u32) -> u8 {
         self.xip.get(offset as usize).copied().unwrap_or(0)
     }
@@ -426,6 +440,23 @@ mod tests {
         assert_eq!(mem.xip_read32(16), 0);
         // xip_read8 past end: Vec::get().unwrap_or(0).
         assert_eq!(mem.xip_read8(16), 0);
+    }
+
+    #[test]
+    fn xip_write_overwrites_in_place_and_clamps_at_end() {
+        let mut mem = Memory::with_flash(16, 64, 8);
+        mem.load_flash(&[0x11; 8]);
+        // In-range write replaces only the addressed bytes.
+        assert_eq!(mem.xip_write(2, &[0xA0, 0xA1]), 2);
+        assert_eq!(mem.xip_read32(0), 0xA1A0_1111);
+        assert_eq!(mem.xip_read32(4), 0x1111_1111);
+        // A write straddling the end keeps its in-range prefix only.
+        assert_eq!(mem.xip_write(6, &[0xB0, 0xB1, 0xB2, 0xB3]), 2);
+        assert_eq!(mem.xip_read16(6), 0xB1B0);
+        assert_eq!(mem.flash_size(), 8, "the backing never grows");
+        // Past the end: nothing written, no panic.
+        assert_eq!(mem.xip_write(8, &[0xC0]), 0);
+        assert_eq!(mem.xip_write(u32::MAX, &[0xC0]), 0);
     }
 
     #[test]
