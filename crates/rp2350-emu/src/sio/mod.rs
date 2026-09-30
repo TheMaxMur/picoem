@@ -409,6 +409,12 @@ impl Sio {
         (vld as u32) | ((rdy as u32) << 1) | ((wof as u32) << 2) | ((roe as u32) << 3)
     }
 
+    /// The level of `core`'s SIO_IRQ_FIFO line: its RX FIFO holds data, or
+    /// one of its sticky WOF / ROE flags is set (datasheet §3.1.5).
+    pub fn fifo_irq_level(&self, core: usize) -> bool {
+        self.fifo_st_read(core) & 0xD != 0
+    }
+
     /// Write FIFO_ST: W1C for WOF and ROE bits.
     fn fifo_st_write(&mut self, val: u32, core: usize) {
         if val & 0x4 != 0 {
@@ -602,6 +608,26 @@ mod tests {
     fn div_csr_cold_read_is_zero() {
         let mut sio = Sio::new();
         assert_eq!(sio.read32(0x078, 0), 0, "DIV_CSR must be 0 on cold read");
+    }
+
+    #[test]
+    fn fifo_irq_follows_rx_data_and_the_sticky_flags() {
+        let mut sio = Sio::new();
+        assert!(!sio.fifo_irq_level(0) && !sio.fifo_irq_level(1));
+        sio.write32(0x054, 0xDEAD_BEEF, 0); // core 0 FIFO_WR
+        assert!(sio.fifo_irq_level(1), "core 1 has data");
+        assert!(!sio.fifo_irq_level(0), "the writer's line stays low");
+        assert_eq!(sio.read32(0x058, 1), 0xDEAD_BEEF);
+        assert!(!sio.fifo_irq_level(1), "drained");
+        sio.read32(0x058, 1); // underflow
+        assert!(sio.fifo_irq_level(1), "ROE holds the line up");
+        sio.write32(0x050, 0x8, 1); // W1C ROE
+        assert!(!sio.fifo_irq_level(1));
+        for i in 0..9 {
+            sio.write32(0x054, i, 0); // the ninth overflows the 8-deep FIFO
+        }
+        sio.read32(0x058, 1);
+        assert!(sio.fifo_irq_level(0), "WOF is the writer's");
     }
 
     // ---- Doorbell tests (Stage C1) ----

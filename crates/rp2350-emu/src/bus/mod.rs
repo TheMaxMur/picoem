@@ -18,8 +18,8 @@ use crate::dreq::{
 };
 use crate::irq::{
     IRQ_ADC_IRQ_FIFO, IRQ_I2C0_IRQ, IRQ_I2C1_IRQ, IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1,
-    IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_TIMER0_IRQ_0, IRQ_TIMER1_IRQ_0, IRQ_UART0_IRQ, IRQ_UART1_IRQ,
-    PERIPH_IRQ_MASK,
+    IRQ_SIO_IRQ_BELL, IRQ_SIO_IRQ_FIFO, IRQ_SPI0_IRQ, IRQ_SPI1_IRQ, IRQ_TIMER0_IRQ_0,
+    IRQ_TIMER1_IRQ_0, IRQ_UART0_IRQ, IRQ_UART1_IRQ, PERIPH_IRQ_MASK,
 };
 use crate::memory::{Memory, SRAM_SIZE, bank_for_address};
 use crate::peripherals::adc::{ADC_BASE, AdcRegs};
@@ -1206,6 +1206,18 @@ impl Bus {
             }
             let bits = self.timer1.poll_alarms();
             self.raise_timer_irqs(bits);
+        }
+
+        // SIO_IRQ_FIFO and SIO_IRQ_BELL are core-local and level-sensitive
+        // (datasheet §3.1.5, §3.1.6): high while a core's RX FIFO has data or
+        // a sticky flag is set, or while one of its doorbells is rung.
+        for core in 0..2 {
+            if self.sio.fifo_irq_level(core) {
+                self.assert_irq_core(core, IRQ_SIO_IRQ_FIFO);
+            }
+            if self.sio.doorbell_pending[core] != 0 {
+                self.assert_irq_core(core, IRQ_SIO_IRQ_BELL);
+            }
         }
 
         // Phase 2 peripherals — each advances per sys_clk unless held

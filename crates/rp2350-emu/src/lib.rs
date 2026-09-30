@@ -2459,6 +2459,50 @@ mod stage5_lib_residue {
         assert_eq!(emu.core(0).regs.ipsr(), 16 + 3, "the IRQ is then taken");
     }
 
+    /// A word in the inter-core FIFO raises the receiver's SIO_IRQ_FIFO:
+    /// embassy-rp's `pause_core1` spins until core 1 takes exactly that.
+    #[test]
+    fn a_fifo_word_interrupts_the_receiving_core() {
+        let irq = crate::irq::IRQ_SIO_IRQ_FIFO;
+        let mut emu = core1_asleep_with(irq);
+        emu.bus.write32(0xD000_0054, 0xDEAD_BEEF, 0); // core 0's FIFO_WR
+        emu.step().unwrap();
+        emu.step().unwrap();
+        assert_eq!(emu.core(1).regs.ipsr(), 16 + irq);
+        assert_eq!(emu.core(0).regs.ipsr(), 0, "the writer is not interrupted");
+    }
+
+    #[test]
+    fn a_doorbell_interrupts_the_rung_core() {
+        let irq = crate::irq::IRQ_SIO_IRQ_BELL;
+        let mut emu = core1_asleep_with(irq);
+        emu.bus.write32(0xD000_0180, 1, 0); // core 0's DOORBELL_OUT_SET
+        emu.step().unwrap();
+        emu.step().unwrap();
+        assert_eq!(emu.core(1).regs.ipsr(), 16 + irq);
+    }
+
+    /// Core 0 held, core 1 asleep in WFE with `irq` enabled and a handler.
+    fn core1_asleep_with(irq: u32) -> Emulator {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.memory.sram_write16(0, 0xBF20); // wfe
+        emu.bus.memory.sram_write16(2, 0xE7FE); // b .
+        emu.bus.memory.sram_write16(0x100, 0xE7FE); // the handler: b .
+        emu.bus
+            .memory
+            .sram_write32(0x200 + 4 * (16 + irq), 0x2000_0101);
+        emu.core_mut(0).halt();
+        let c = emu.core_mut(1);
+        c.ppb.vtor = 0x2000_0200;
+        c.regs.msp = 0x2000_1000;
+        c.regs.r[13] = 0x2000_1000;
+        c.regs.set_pc(0x2000_0000);
+        c.ppb.nvic_iser[0].fetch_or(1 << irq, Ordering::Relaxed);
+        emu.step().unwrap();
+        assert!(emu.bus.atomics.is_wfe_waiting(1));
+        emu
+    }
+
     /// A parked core sleeps in step with the chip. Woken after a long
     /// WFE it resumes one quantum at a time; it must not replay the
     /// sleep as a burst of instructions that takes no emulated time
