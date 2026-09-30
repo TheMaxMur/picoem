@@ -3430,6 +3430,13 @@ impl Bus {
                 let offset = addr - CORESIGHT_TRACE_BASE;
                 self.coresight_trace.write32(offset, val, 0);
             }
+            // The mask ROM ignores writes, as write8/write16 already do.
+            // The bootrom relies on it: outside its own boot path it hands
+            // shared code a "fake MPU" at address 0 and lets the MPU
+            // updates land on ROM (varm_boot_path.h
+            // `inline_s_get_fake_mpu_sau`), e.g. a word store to 0x1C on
+            // every BOOTSEL entry.
+            0x0 => {}
             // Unmapped regions raise a precise bus fault so flush-style
             // writers (Phase 7 Stage B lazy FP) and other speculative
             // stores see the failure. Mirrors the read32 unmapped path.
@@ -4052,6 +4059,20 @@ mod xip_window_tests {
             assert_eq!(bus.read16(0x13FF_FFFC, 0), 0xBEEF);
             assert_eq!(bus.read8(0x13FF_FFFF, 0), 0x5A);
         }
+    }
+
+    /// Word stores to the ROM are ignored like byte and halfword ones,
+    /// without a bus fault (the bootrom's fake-MPU writes to 0x1C).
+    #[test]
+    fn rom_word_stores_are_ignored_without_a_fault() {
+        let mut bus = Bus::new();
+        bus.load_bootrom(&[0xAAu8; 0x8000]);
+        bus.write32(0x0000_001C, 0x1000_0001, 0);
+        bus.write16(0x0000_0020, 0x1234, 0);
+        bus.write8(0x0000_0024, 0x56, 0);
+        assert!(!bus.atomics.is_bus_fault(0));
+        assert_eq!(bus.read32(0x0000_001C, 0), 0xAAAA_AAAA);
+        assert_eq!(bus.read32(0x0000_0020, 0), 0xAAAA_AAAA);
     }
 
     /// Without flash the 0x1C00_0000 window keeps serving picoem's XIP
