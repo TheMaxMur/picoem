@@ -787,45 +787,24 @@ impl CortexM33 {
     ///   [22]    S  — the address is Secure (Secure state only)
     ///   [23]    IRVALID — IDAU region valid (Secure state only)
     ///   [31:24] IREGION — IDAU region number
+    #[cfg(test)]
     pub(crate) fn execute_tt(&self, addr: u32) -> u32 {
-        let ppb = &self.ppb;
+        self.execute_tt_variant(addr, false, false)
+    }
 
-        // --- MPU contribution (MRVALID / MREGION + R/RW if matched) ---
-        //
-        // The bootrom's MPU self-test (see `check_mpu_loop2` in
-        // `roms/rp2350/arm-bootrom.dis`) performs `tt r4, r4` on an address that
-        // must land inside one of the just-written MPU regions, and
-        // checks the result has MRVALID=1, MREGION=<expected>, R=1 (but
-        // NOT RW, since the region was written with AP requiring priv-
-        // only writes).
-        let mpu_enabled = ppb.mpu_ctrl & 1 != 0;
-        let mut mpu_bits: u32 = 0;
-        if mpu_enabled {
-            for i in 0..16 {
-                let (rbar, rlar) = ppb.mpu_regions[i];
-                if rlar & 1 == 0 {
-                    continue; // region disabled
-                }
-                let base = rbar & !0x1F;
-                let limit = (rlar & !0x1F) | 0x1F;
-                if addr >= base && addr <= limit {
-                    mpu_bits |= 1 << 16; // MRVALID
-                    mpu_bits |= (i as u32) & 0xFF; // MREGION [7:0]
-                    // AP[2:1] (RBAR bits [2:1]): 00 priv RW, 01 any RW,
-                    // 10 priv RO, 11 any RO; TT runs privileged here.
-                    mpu_bits |= 1 << 18; // R
-                    let ap = (rbar >> 1) & 0x3;
-                    if ap == 0 || ap == 1 {
-                        mpu_bits |= 1 << 19; // RW (writable)
-                    }
-                    break;
-                }
+    /// TT, TTT (`unpriv`: the unprivileged view), TTA (`alt`: the
+    /// Non-secure MPU, from Secure state) and TTAT.
+    pub(crate) fn execute_tt_variant(&self, addr: u32, alt: bool, unpriv: bool) -> u32 {
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        let mut result = 0;
+        // MPU region information is only available when privileged or when
+        // inspecting the other domain's MPU (ARMv8-M `TTResp`).
+        if privileged || alt {
+            let (r, rw, region) = self.mpu_access(addr, alt || !self.secure, unpriv);
+            result |= (r as u32) << 18 | (rw as u32) << 19;
+            if let Some(i) = region {
+                result |= i as u32 | 1 << 16;
             }
-        }
-        // No MPU match: the default memory map, readable and writable.
-        let mut result = mpu_bits;
-        if mpu_bits == 0 {
-            result |= (1 << 19) | (1 << 18);
         }
 
         // Security attribution is only reported to Secure state.
@@ -844,6 +823,38 @@ impl CortexM33 {
             }
         }
         result
+    }
+
+    /// Read and read-write permission of `addr` under one security
+    /// domain's MPU, and the region that decided it. The first enabled
+    /// region that matches wins (the bootrom's MPU self-test relies on
+    /// it). No match: the default memory map for privileged code when
+    /// PRIVDEFENA is set, no access otherwise; MPU off: the default map.
+    fn mpu_access(&self, addr: u32, ns_mpu: bool, unpriv: bool) -> (bool, bool, Option<u8>) {
+        let (ctrl, regions) = if ns_mpu {
+            (self.ppb.ns.mpu_ctrl, &self.ppb.ns.mpu_regions)
+        } else {
+            (self.ppb.mpu_ctrl, &self.ppb.mpu_regions)
+        };
+        if ctrl & 1 == 0 {
+            return (true, true, None);
+        }
+        let hit = (0..16u8).find(|&i| {
+            let (rbar, rlar) = regions[i as usize];
+            rlar & 1 != 0 && addr >= rbar & !0x1F && addr <= (rlar & !0x1F) | 0x1F
+        });
+        let Some(i) = hit else {
+            let default = !unpriv && ctrl & 4 != 0; // PRIVDEFENA
+            return (default, default, None);
+        };
+        // AP[2:1] (RBAR bits [2:1]): 00 priv RW, 01 any RW, 10 priv RO, 11 any RO.
+        let ap = (regions[i as usize].0 >> 1) & 0x3;
+        let (r, rw) = if unpriv {
+            (ap & 1 != 0, ap == 1)
+        } else {
+            (true, ap & 2 == 0)
+        };
+        (r, rw, Some(i))
     }
 
     /// Data-side security attribution of `addr` (ARMv8-M `SecurityCheck`):
@@ -1184,6 +1195,77 @@ mod tests {
             r & (1 << 19),
             0,
             "RW must reflect region 1's AP=00, not region 7's AP=10"
+        );
+    }
+
+    /// The bootrom's nsboot launch checks `tta` on SRAM against 0x4D0000:
+    /// the Non-secure MPU's region 0 (NSBOOT_END..4 GB, AP privileged RW)
+    /// matches, read-write, and the address is still Secure. TT without A
+    /// sees the Secure MPU instead.
+    #[test]
+    fn tta_queries_the_non_secure_mpu() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.sau_ctrl = 1;
+        cpu.ppb.ns.mpu_ctrl = 5; // PRIVDEFENA | ENABLE
+        cpu.ppb.ns.mpu_regions[0] = (0x6AA1, 0xFFFF_FFE1);
+        cpu.ppb.mpu_ctrl = 5;
+        cpu.ppb.mpu_regions[3] = (0x2000_0000 | (2 << 1), 0x2000_FFE1); // priv RO
+        assert_eq!(
+            cpu.execute_tt_variant(0x2000_0000, true, false),
+            0x004D_0000
+        );
+        let r = cpu.execute_tt_variant(0x2000_0000, false, false);
+        assert_eq!(
+            r & 0xFF_00FF,
+            0x45_0003,
+            "Secure MPU region 3, read-only, Secure"
+        );
+    }
+
+    /// TTT reports the unprivileged view of the same region.
+    #[test]
+    fn ttt_uses_unprivileged_permissions() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.mpu_ctrl = 5;
+        for (ap, priv_rw, unpriv_r, unpriv_rw) in [
+            (0, true, false, false),
+            (1, true, true, true),
+            (2, false, false, false),
+            (3, false, true, false),
+        ] {
+            cpu.ppb.mpu_regions[0] = (0x2000_0000 | (ap << 1), 0x2000_FFE1);
+            let p = cpu.execute_tt_variant(0x2000_0100, false, false);
+            let u = cpu.execute_tt_variant(0x2000_0100, false, true);
+            assert_eq!(p & (1 << 19) != 0, priv_rw, "AP {ap} privileged RW");
+            assert_eq!(u & (1 << 18) != 0, unpriv_r, "AP {ap} unprivileged R");
+            assert_eq!(u & (1 << 19) != 0, unpriv_rw, "AP {ap} unprivileged RW");
+            assert_ne!(u & (1 << 16), 0, "MRVALID either way");
+        }
+    }
+
+    /// No region matches: the default map only for privileged code with
+    /// PRIVDEFENA; unprivileged thread code without A gets no MPU answer.
+    #[test]
+    fn mpu_miss_follows_privdefena_and_privilege() {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.mpu_ctrl = 1;
+        assert_eq!(
+            cpu.execute_tt_variant(0x2000_0000, false, false) & (3 << 18),
+            0
+        );
+        cpu.ppb.mpu_ctrl = 5;
+        assert_eq!(
+            cpu.execute_tt_variant(0x2000_0000, false, false) & (3 << 18),
+            3 << 18
+        );
+        assert_eq!(
+            cpu.execute_tt_variant(0x2000_0000, false, true) & (3 << 18),
+            0
+        );
+        cpu.regs.control |= 1; // unprivileged thread
+        assert_eq!(
+            cpu.execute_tt_variant(0x2000_0000, false, false) & 0xF_00FF,
+            0
         );
     }
 }

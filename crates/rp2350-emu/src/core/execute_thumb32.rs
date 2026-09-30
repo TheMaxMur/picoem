@@ -801,12 +801,18 @@ impl CortexM33 {
             return 2;
         }
         if hw0 & 0xFFF0 == 0xE840 {
-            // TT family: hw1[15:12]=0xF, hw1[7:0]=0x00
-            if (hw1 >> 12) & 0xF == 0xF && hw1 & 0xFF == 0x00 {
+            // TT family: hw1[15:12]=0xF, hw1[5:0]=0; A=hw1[7], T=hw1[6]
+            // (TT, TTT, TTA, TTAT).
+            if (hw1 >> 12) & 0xF == 0xF && hw1 & 0x3F == 0x00 {
                 let rn = (hw0 & 0xF) as usize;
                 let rd = ((hw1 >> 8) & 0xF) as usize;
+                let (alt, unpriv) = (hw1 & 0x80 != 0, hw1 & 0x40 != 0);
+                if alt && !self.secure {
+                    // TTA / TTAT are UNDEFINED in Non-secure state.
+                    return self.thumb32_undefined(hw0, hw1, bus);
+                }
                 let addr = self.regs.r[rn];
-                self.regs.r[rd] = self.execute_tt(addr);
+                self.regs.r[rd] = self.execute_tt_variant(addr, alt, unpriv);
                 return 1;
             }
             // STREX: monitor-gated store. No value comparison; address-only.

@@ -6920,6 +6920,26 @@ fn tt_exempt_rom_and_ns_state_reports() {
     }
 }
 
+/// `tta r4, r0` (hw1 0xF480) is TT with A set, not STREX; from
+/// Non-secure state TTA is UNDEFINED.
+#[test]
+fn tta_decodes_as_test_target() {
+    let (mut c, mut bus) = core_and_bus();
+    c.ppb.sau_ctrl = 1;
+    c.ppb.ns.mpu_ctrl = 5;
+    c.ppb.ns.mpu_regions[0] = (0x6AA1, 0xFFFF_FFE1);
+    c.set_reg(0, 0x2000_0000);
+    c.execute_one_wide_with_bus(0xE840, 0xF480, &mut bus);
+    assert_eq!(c.reg(4), 0x004D_0000);
+    assert!(c.pending_fault.is_none());
+    c.transition_to_nonsecure();
+    c.execute_one_wide_with_bus(0xE840, 0xF480, &mut bus);
+    assert!(matches!(
+        c.pending_fault,
+        Some(crate::core::Fault::UsageFault)
+    ));
+}
+
 #[test]
 fn tt_does_not_collide_with_strex() {
     // STREX R0, R1, [R2, #0]: hw0=0xE842, hw1=0x1000
