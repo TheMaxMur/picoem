@@ -428,6 +428,10 @@ pub struct Bus {
     /// PLL CS reads and write-time lock-arm transitions observe a fresh
     /// cycle. See `wrk_docs/2026.04.15 - HLD - PLL LOCK Modelling.md` §6 P2.
     pub(crate) master_cycle: u64,
+    /// clk_ref cycles owed to the tick generators, in clk_sys-cycle units
+    /// times `ref_clk_hz`: the remainder of the last clk_sys → clk_ref
+    /// conversion, so no fraction of a tick is lost between quanta.
+    pub(crate) ref_clk_residue: u64,
     /// Master cycle at which PLL_SYS's lock-detect counter expires. `None`
     /// means the PLL is not currently armed (powered down, unconfigured,
     /// or hasn't been powered up yet). Managed by `pll_sys_write` via
@@ -647,6 +651,7 @@ impl Bus {
             pll_sys_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
             pll_usb_regs: [0x0000_0001, 0x0000_002D, 0, 0x0007_7000],
             master_cycle: 0,
+            ref_clk_residue: 0,
             pll_sys_lock_at_cycle: None,
             pll_usb_lock_at_cycle: None,
             rosc_regs: [0u32; 9],
@@ -726,6 +731,23 @@ impl Bus {
     /// Current effective reference clock frequency in Hz.
     pub fn ref_clk_hz(&self) -> u32 {
         self.clock_tree.ref_clk_hz
+    }
+
+    /// clk_ref cycles elapsed during `sys_clks` clk_sys cycles, carrying
+    /// the fractional remainder to the next call. An unmodelled clock
+    /// source (either frequency 0) falls back to one clk_ref per clk_sys.
+    pub(crate) fn sys_to_ref_clks(&mut self, sys_clks: u32) -> u32 {
+        let (sys_hz, ref_hz) = (
+            self.clock_tree.sys_clk_hz as u64,
+            self.clock_tree.ref_clk_hz as u64,
+        );
+        if sys_hz == 0 || ref_hz == 0 {
+            self.ref_clk_residue = 0;
+            return sys_clks;
+        }
+        let num = sys_clks as u64 * ref_hz + self.ref_clk_residue;
+        self.ref_clk_residue = num % sys_hz;
+        (num / sys_hz) as u32
     }
 
     /// Recompute `clock_tree.sys_clk_hz` / `ref_clk_hz` from the
@@ -1151,7 +1173,10 @@ impl Bus {
         // TICKS runs unconditionally — there is no RESETS bit for the
         // tick generator (it is bus-level plumbing). Advance all six
         // domains; consumers (TIMER0/TIMER1/RISCV-MTIME) drain edges.
-        self.ticks.advance_all(sys_clks);
+        // The generators count clk_ref, not clk_sys (datasheet §8.5;
+        // pico-sdk and embassy-rp program CYCLES = clk_ref / 1 MHz).
+        let ref_clks = self.sys_to_ref_clks(sys_clks);
+        self.ticks.advance_all(ref_clks);
 
         // MTIME (SIO §3.1.8) — drain RISCV TICKS edges and advance the
         // RISC-V platform timer. `Sio::tick_mtime_from_ticks` picks
@@ -4082,5 +4107,53 @@ mod xip_window_tests {
         let mut bus = Bus::new();
         bus.write32(0x1C00_0010, 0x1234_5678, 0);
         assert_eq!(bus.read32(0x1C00_0010, 0), 0x1234_5678);
+    }
+}
+
+#[cfg(test)]
+mod tick_clock_tests {
+    use crate::peripherals::ticks::TICKS_BASE;
+    use crate::peripherals::timer::{TIMER0_BASE, TIMERAWL_OFFSET};
+    use crate::{Config, Emulator};
+
+    /// With the post-bootrom clocks (clk_sys 150 MHz, clk_ref 12 MHz,
+    /// TICKS.TIMER0.CYCLES = 12) TIMER0 counts real microseconds: 10 ms of
+    /// clk_sys is 10 000 us, not the 125 000 a clk_sys-fed divider makes.
+    /// 64-cycle quanta are 5.12 clk_ref cycles each, so this also holds
+    /// the fraction carried between quanta.
+    #[test]
+    fn timer0_counts_microseconds_of_clk_ref() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.atomics.set_halted(0);
+        emu.bus.atomics.set_halted(1);
+        assert_eq!(
+            (emu.bus.sys_clk_hz(), emu.bus.ref_clk_hz()),
+            (150_000_000, 12_000_000)
+        );
+        // TICKS.TIMER0: CYCLES = clk_ref / 1 MHz, then ENABLE (embassy-rp order).
+        emu.mmio_write32(TICKS_BASE + 0x18 + 0x04, 12);
+        emu.mmio_write32(TICKS_BASE + 0x18, 1);
+        let t0 = emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0);
+        emu.run(1_500_000).unwrap();
+        let us = emu.bus.read32(TIMER0_BASE + TIMERAWL_OFFSET, 0) - t0;
+        assert!(
+            (9_999..=10_001).contains(&us),
+            "{us} us after 10 ms of emulated time"
+        );
+    }
+
+    /// Equal clocks (clk_sys run from clk_ref, as the bootrom does) keep
+    /// one clk_ref cycle per clk_sys cycle.
+    #[test]
+    fn equal_clocks_convert_one_to_one() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.seed_sys_clk_hz(12_000_000);
+        assert_eq!(emu.bus.sys_to_ref_clks(64), 64);
+        emu.bus.seed_sys_clk_hz(0);
+        assert_eq!(
+            emu.bus.sys_to_ref_clks(64),
+            64,
+            "an unmodelled source falls back to 1:1"
+        );
     }
 }

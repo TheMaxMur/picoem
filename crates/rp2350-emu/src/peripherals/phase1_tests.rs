@@ -291,6 +291,8 @@ fn emulator_reset_restores_post_bootrom_ticks_cycles() {
 #[test]
 fn tick_peripherals_advances_timer0_after_ticks_enable() {
     let mut bus = Bus::new();
+    // clk_sys = clk_ref, so each clk_sys tick below is one clk_ref tick.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.tick_peripherals(120);
@@ -319,6 +321,8 @@ fn tick_peripherals_timer0_halts_when_ticks_cycles_zero() {
 #[test]
 fn tick_peripherals_alarm_match_raises_irq_via_assert_shared() {
     let mut bus = Bus::new();
+    // clk_sys = clk_ref, so each clk_sys tick below is one clk_ref tick.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.write32(TIMER0_BASE + INTE_OFFSET, 0x1, 0);
@@ -342,6 +346,8 @@ fn tick_peripherals_alarm_match_raises_irq_via_assert_shared() {
 #[test]
 fn tick_peripherals_timer1_fires_on_its_own_irq_base() {
     let mut bus = Bus::new();
+    // clk_sys = clk_ref, so each clk_sys tick below is one clk_ref tick.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t1 = TICKS_BASE + DOMAIN_TIMER1 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t1, CTRL_ENABLE, 0);
     bus.write32(TIMER1_BASE + INTE_OFFSET, 0x1, 0);
@@ -356,6 +362,8 @@ fn tick_peripherals_timer1_fires_on_its_own_irq_base() {
 #[test]
 fn emulator_step_calls_tick_peripherals_each_iteration() {
     let mut emu = Emulator::new(crate::Config::default());
+    // clk_sys = clk_ref, so each clk_sys tick below is one clk_ref tick.
+    emu.bus.seed_sys_clk_hz(12_000_000);
     {
         let arm = emu.cores.expect_arm_mut();
         arm[0].halt();
@@ -394,6 +402,8 @@ fn ticks_cycles_change_preserves_timer_alarms() {
     // (datasheet §12.8 — alarms count against the µs timer regardless
     // of the divider).
     let mut bus = Bus::new();
+    // clk_sys = clk_ref, so each clk_sys tick below is one clk_ref tick.
+    bus.seed_sys_clk_hz(12_000_000);
     let ticks_ctrl_t0 = TICKS_BASE + DOMAIN_TIMER0 as u32 * DOMAIN_STRIDE;
     bus.write32(ticks_ctrl_t0, CTRL_ENABLE, 0);
     bus.write32(TIMER0_BASE + ALARM0_OFFSET, 100, 0);
