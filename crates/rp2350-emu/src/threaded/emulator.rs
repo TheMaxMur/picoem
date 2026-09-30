@@ -206,7 +206,6 @@ impl ThreadedEmulator {
             xosc_regs,
             gpio_hi_noise_state,
             qmi_regs,
-            xip_cache_offset,
             gpio_in,
             gpio_in_hi,
             gpio_external_in,
@@ -306,7 +305,7 @@ impl ThreadedEmulator {
             }),
             qmi: Mutex::new(QmiState {
                 qmi_regs,
-                xip_cache_offset,
+                xip_cache_offset: 0,
             }),
             resets: Mutex::new(ResetsState { resets_state }),
             apb: Mutex::new(ApbState {

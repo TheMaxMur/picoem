@@ -453,9 +453,6 @@ pub struct Bus {
     /// When flash is loaded, returns pseudo-random noise to simulate
     /// QSPI pin activity (the bootrom samples this to detect flash).
     pub(crate) gpio_hi_noise_state: u32,
-    /// XIP cache window offset: maps XIP SRAM reads (0x1C00_0000)
-    /// to flash content at this byte offset. Set by QMI M0_RFMT writes.
-    pub(crate) xip_cache_offset: u32,
     /// Single-cycle IO block (GPIO, CPUID, spinlocks, FIFO, divider, etc.).
     pub sio: Sio,
     /// Three PIO blocks (PIO0, PIO1, PIO2).
@@ -655,7 +652,6 @@ impl Bus {
             rosc_regs: [0u32; 9],
             xosc_regs: [0u32; 5],
             gpio_hi_noise_state: 0xA5A5_A5A5,
-            xip_cache_offset: 0,
             sio: Sio::new(),
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
             gpio_in: AtomicU32::new(0),
@@ -781,6 +777,22 @@ impl Bus {
 
     fn is_xip_sram(addr: u32) -> bool {
         (0x1C00_0000..0x1C00_4000).contains(&addr)
+    }
+
+    /// Flash byte offset behind an XIP read with loaded flash. The cached
+    /// window (0x1000_0000), the uncached no-allocate one (0x1400_0000) and
+    /// the untranslated one (0x1C00_0000) all see chip-select 0's 16 MB
+    /// (RP2350 datasheet address map, `XIP_*_BASE` in pico-sdk
+    /// addressmap.h); the bootrom reads block loops and partition tables
+    /// through the untranslated window. Address translation (QMI ATRANS)
+    /// is the reset identity. `offset` is the caller's `addr & 0x0FFF_FFFF`
+    /// fallback for the other windows.
+    #[inline]
+    fn xip_flash_offset(addr: u32, offset: u32) -> u32 {
+        match addr >> 24 {
+            0x10 | 0x14 | 0x1C => addr & 0x00FF_FFFF,
+            _ => offset,
+        }
     }
 
     fn xip_sram_read8(&self, addr: u32) -> u8 {
@@ -1589,10 +1601,7 @@ impl Bus {
         };
         let val = match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
-            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => self
-                .memory
-                .xip_read8((addr - 0x1C00_0000) + self.xip_cache_offset),
-            0x1 if Self::is_xip_sram(addr) => self.xip_sram_read8(addr),
+            0x1 if Self::is_xip_sram(addr) && !self.flash_loaded => self.xip_sram_read8(addr),
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -1601,7 +1610,7 @@ impl Bus {
                     }
                     return 0;
                 }
-                self.memory.xip_read8(offset)
+                self.memory.xip_read8(Self::xip_flash_offset(addr, offset))
             }
             0x2 if offset < SRAM_SIZE as u32 => {
                 // sram_bank_wait removed: bank 2/6 penalty is modeled on
@@ -2376,10 +2385,7 @@ impl Bus {
         };
         let val = match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
-            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => self
-                .memory
-                .xip_read16((addr - 0x1C00_0000) + self.xip_cache_offset),
-            0x1 if Self::is_xip_sram(addr) => self.xip_sram_read16(addr),
+            0x1 if Self::is_xip_sram(addr) && !self.flash_loaded => self.xip_sram_read16(addr),
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -2388,7 +2394,7 @@ impl Bus {
                     }
                     return 0;
                 }
-                self.memory.xip_read16(offset)
+                self.memory.xip_read16(Self::xip_flash_offset(addr, offset))
             }
             0x2 if (offset + 1) < SRAM_SIZE as u32 => {
                 // sram_bank_wait removed: bank penalty on instruction fetch only.
@@ -3082,14 +3088,7 @@ impl Bus {
         };
         let val = match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
-            0x1 if Self::is_xip_sram(addr) && self.flash_loaded => {
-                // XIP SRAM (0x1C00_0000): when flash is loaded, the bootrom
-                // reads flash through this window. Map reads to flash content
-                // using the current window offset tracked by QMI configuration.
-                let xip_offset = (addr - 0x1C00_0000) + self.xip_cache_offset;
-                self.memory.xip_read32(xip_offset)
-            }
-            0x1 if Self::is_xip_sram(addr) => self.xip_sram_read32(addr),
+            0x1 if Self::is_xip_sram(addr) && !self.flash_loaded => self.xip_sram_read32(addr),
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -3098,7 +3097,7 @@ impl Bus {
                     }
                     return 0;
                 }
-                self.memory.xip_read32(offset)
+                self.memory.xip_read32(Self::xip_flash_offset(addr, offset))
             }
             0x2 if (offset + 3) < SRAM_SIZE as u32 => {
                 // sram_bank_wait removed: bank penalty on instruction fetch only.
@@ -3965,5 +3964,61 @@ mod write_flash_tests {
         assert_eq!(emu.bus.write_flash(0xFFE, &[0xAA, 0xBB, 0xCC]), 2);
         assert_eq!(emu.bus.memory.flash_size(), 0x1000);
         assert_eq!(emu.bus.memory.xip_read16(0xFFE), 0xBBAA);
+    }
+}
+
+#[cfg(test)]
+mod xip_window_tests {
+    use super::Bus;
+
+    /// A flash image whose every byte is a function of its offset.
+    fn bus_with_flash(len: usize) -> Bus {
+        let mut bus = Bus::new();
+        let image: Vec<u8> = (0..len).map(|i| (i ^ (i >> 8) ^ (i >> 16)) as u8).collect();
+        bus.load_flash(&image);
+        bus
+    }
+
+    /// The bootrom reads a block loop's far blocks through the
+    /// untranslated window (0x1C00_0000 + flash offset), and data can be
+    /// read uncached through 0x1400_0000: both must see the same flash as
+    /// the cached window at any offset, not only the first 16 KB.
+    #[test]
+    fn uncached_and_untranslated_windows_alias_the_flash() {
+        let mut bus = bus_with_flash(0x10_0000);
+        let off = 0x000C_BE88u32; // far past the first 16 KB
+        for base in [0x1000_0000u32, 0x1400_0000, 0x1C00_0000] {
+            let a = base + off;
+            assert_eq!(
+                bus.read32(a, 0),
+                bus.memory.xip_read32(off),
+                "32-bit at {a:#x}"
+            );
+            assert_eq!(
+                bus.read16(a + 2, 0),
+                bus.memory.xip_read16(off + 2),
+                "16-bit at {a:#x}"
+            );
+            assert_eq!(
+                bus.read8(a + 1, 0),
+                bus.memory.xip_read8(off + 1),
+                "8-bit at {a:#x}"
+            );
+            assert!(!bus.atomics.is_bus_fault(0));
+        }
+        assert_ne!(
+            bus.memory.xip_read32(off),
+            0,
+            "the probe word must not be 0"
+        );
+    }
+
+    /// Without flash the 0x1C00_0000 window keeps serving picoem's XIP
+    /// scratch RAM.
+    #[test]
+    fn untranslated_window_without_flash_is_still_scratch_ram() {
+        let mut bus = Bus::new();
+        bus.write32(0x1C00_0010, 0x1234_5678, 0);
+        assert_eq!(bus.read32(0x1C00_0010, 0), 0x1234_5678);
     }
 }
