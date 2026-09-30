@@ -171,14 +171,11 @@ impl ThreadedSio {
     ///
     /// Bits 0/1 (VLD/RDY) are read-only and silently ignored, matching
     /// hardware. Bits 2 (WOF) and 3 (ROE) are cleared when set in `mask`.
-    pub fn fifo_st_clear(&self, core: usize, mask: u32) {
+    pub fn fifo_st_clear(&self, core: usize, _value: u32) {
         debug_assert!(core < 2);
-        if mask & FIFO_ST_WOF != 0 {
-            self.fifo_wof[core].store(false, Relaxed);
-        }
-        if mask & FIFO_ST_ROE != 0 {
-            self.fifo_roe[core].store(false, Relaxed);
-        }
+        // Any write clears both, as on the Serial `Sio`.
+        self.fifo_wof[core].store(false, Relaxed);
+        self.fifo_roe[core].store(false, Relaxed);
     }
 
     // --- Spinlocks ---
@@ -435,14 +432,8 @@ mod tests {
         assert_eq!(st & FIFO_ST_WOF, FIFO_ST_WOF);
         assert_eq!(st & FIFO_ST_ROE, FIFO_ST_ROE);
 
-        // Clear ROE only — WOF must remain.
-        sio.fifo_st_clear(0, FIFO_ST_ROE);
-        let st = sio.fifo_st(0);
-        assert_eq!(st & FIFO_ST_ROE, 0);
-        assert_eq!(st & FIFO_ST_WOF, FIFO_ST_WOF);
-
-        // Clear WOF too.
-        sio.fifo_st_clear(0, FIFO_ST_WOF);
+        // Any write clears both, whatever it writes.
+        sio.fifo_st_clear(0, 0);
         let st = sio.fifo_st(0);
         assert_eq!(st & FIFO_ST_WOF, 0);
         assert_eq!(st & FIFO_ST_ROE, 0);

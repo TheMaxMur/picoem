@@ -7931,7 +7931,7 @@ fn fifo_st_reflects_vld_and_rdy() {
 }
 
 #[test]
-fn fifo_st_w1c_clears_wof_and_roe() {
+fn fifo_st_any_write_clears_wof_and_roe() {
     let mut bus = Bus::new();
     // Trigger ROE by reading empty FIFO
     bus.read32(FIFO_RD, 0);
@@ -7946,18 +7946,12 @@ fn fifo_st_w1c_clears_wof_and_roe() {
     assert!(st & 0x4 != 0, "WOF should be set");
     assert!(st & 0x8 != 0, "ROE should still be set");
 
-    // W1C: clear WOF only
-    bus.write32(FIFO_ST, 0x4, 0);
+    // Any write clears both: a zero, as embassy-rp's FIFO handler writes
+    bus.write32(FIFO_ST, 0, 0);
     let st = bus.read32(FIFO_ST, 0);
-    assert_eq!(st & 0x4, 0, "WOF should be cleared");
-    assert!(st & 0x8 != 0, "ROE should still be set (not cleared)");
+    assert_eq!(st & 0xC, 0, "WOF and ROE should be cleared");
 
-    // W1C: clear ROE
-    bus.write32(FIFO_ST, 0x8, 0);
-    let st = bus.read32(FIFO_ST, 0);
-    assert_eq!(st & 0x8, 0, "ROE should be cleared");
-
-    // W1C: writing 0xFFFFFFFF clears both
+    // ... or all ones, as pico-sdk's multicore_fifo_clear_irq writes
     bus.read32(FIFO_RD, 0); // trigger ROE again
     for _ in 0..9 {
         bus.write32(FIFO_WR, 0, 0);

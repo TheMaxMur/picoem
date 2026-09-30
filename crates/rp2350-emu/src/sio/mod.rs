@@ -415,14 +415,12 @@ impl Sio {
         self.fifo_st_read(core) & 0xD != 0
     }
 
-    /// Write FIFO_ST: W1C for WOF and ROE bits.
-    fn fifo_st_write(&mut self, val: u32, core: usize) {
-        if val & 0x4 != 0 {
-            self.fifo_wof[core] = false;
-        }
-        if val & 0x8 != 0 {
-            self.fifo_roe[core] = false;
-        }
+    /// Write FIFO_ST: any write clears both sticky flags. pico-sdk's
+    /// `multicore_fifo_clear_irq` says so ("Write any value to clear the
+    /// error flags"), and embassy-rp's FIFO handler clears them writing 0.
+    fn fifo_st_write(&mut self, _val: u32, core: usize) {
+        self.fifo_wof[core] = false;
+        self.fifo_roe[core] = false;
     }
 
     /// Write FIFO_WR: push to OTHER core's RX queue.
@@ -621,7 +619,7 @@ mod tests {
         assert!(!sio.fifo_irq_level(1), "drained");
         sio.read32(0x058, 1); // underflow
         assert!(sio.fifo_irq_level(1), "ROE holds the line up");
-        sio.write32(0x050, 0x8, 1); // W1C ROE
+        sio.write32(0x050, 0, 1); // as embassy-rp's handler clears it
         assert!(!sio.fifo_irq_level(1));
         for i in 0..9 {
             sio.write32(0x054, i, 0); // the ninth overflows the 8-deep FIFO
