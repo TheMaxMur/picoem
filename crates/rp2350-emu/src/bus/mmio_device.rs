@@ -36,6 +36,14 @@
 //! Reads through an alias address reach the device as a plain read of
 //! the canonical offset.
 //!
+//! # Flash
+//!
+//! [`MmioCtx::flash`] and [`MmioCtx::write_flash`] reach the XIP flash
+//! backing the core's reads of 0x1000_0000 see, so a model of an external
+//! flash chip (behind a mounted QMI) can erase and program the same bytes
+//! the XIP read path serves. A write drops both cores' decoded ops for the
+//! XIP region at the next drain point, as [`Bus::write_flash`] does.
+//!
 //! # Time and interrupts
 //!
 //! [`MmioDevice::tick`] runs once per quantum from
@@ -48,7 +56,8 @@
 
 use std::any::Any;
 
-use super::Bus;
+use super::{Bus, invalidation_regions};
+use crate::memory::Memory;
 
 /// A host-side peripheral model. See the [module docs](self) for the
 /// access contract.
@@ -73,8 +82,8 @@ pub trait MmioDevice: Any + Send {
 }
 
 /// Per-call context handed to an [`MmioDevice`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MmioCtx {
+#[derive(Debug, Default)]
+pub struct MmioCtx<'a> {
     /// Bus master that issued the access (core 0 / 1); 0 inside
     /// [`MmioDevice::tick`].
     pub core: u8,
@@ -87,6 +96,43 @@ pub struct MmioCtx {
     /// (bit `n` = NVIC line `n`). Lines outside the peripheral IRQ range
     /// are dropped.
     pub raise_irqs: u64,
+    /// The bus's flash backing; `None` in a context built outside a bus
+    /// call (e.g. `MmioCtx::default()` in a device's own tests).
+    flash: Option<FlashPort<'a>>,
+}
+
+/// A mounted device's handle on the XIP flash backing.
+struct FlashPort<'a> {
+    memory: &'a mut Memory,
+    invalidation_regions: &'a mut u8,
+}
+
+impl std::fmt::Debug for FlashPort<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlashPort")
+            .field("flash_len", &self.memory.xip_bytes().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl MmioCtx<'_> {
+    /// The XIP flash backing (empty when no flash is loaded or the context
+    /// has no bus behind it).
+    pub fn flash(&self) -> &[u8] {
+        self.flash.as_ref().map_or(&[], |f| f.memory.xip_bytes())
+    }
+
+    /// Overwrite flash bytes at `offset` in place, as an external flash
+    /// chip's erase or program would (the caller applies the NOR bit
+    /// semantics). Clamped to the backing; returns the bytes written.
+    pub fn write_flash(&mut self, offset: u32, data: &[u8]) -> usize {
+        let Some(f) = self.flash.as_mut() else {
+            return 0;
+        };
+        let n = f.memory.xip_write(offset, data);
+        *f.invalidation_regions |= invalidation_regions::XIP;
+        n
+    }
 }
 
 /// How address bits 12–13 decode inside a mount.
@@ -238,23 +284,40 @@ impl Bus {
         })
     }
 
-    fn mmio_ctx(&self, core: u8) -> MmioCtx {
-        MmioCtx {
+    /// Run `f` on mount `index` with a context that carries the flash
+    /// port, then raise the IRQs the device asked for.
+    fn with_mount<R>(
+        &mut self,
+        index: usize,
+        core: u8,
+        f: impl FnOnce(&mut dyn MmioDevice, &mut MmioCtx) -> R,
+    ) -> R {
+        let (cycle, sys_clk_hz) = (self.master_cycle, self.clock_tree.sys_clk_hz);
+        let Bus {
+            external_mmio,
+            memory,
+            pending_invalidation_regions,
+            ..
+        } = self;
+        let mut ctx = MmioCtx {
             core,
-            cycle: self.master_cycle,
-            sys_clk_hz: self.clock_tree.sys_clk_hz,
+            cycle,
+            sys_clk_hz,
             raise_irqs: 0,
-        }
+            flash: Some(FlashPort {
+                memory,
+                invalidation_regions: pending_invalidation_regions,
+            }),
+        };
+        let r = f(external_mmio[index].device.as_mut(), &mut ctx);
+        let raise = ctx.raise_irqs;
+        self.raise_irqs_u64(raise);
+        r
     }
 
     /// Route a read to mount `index`; raises the IRQs it asks for.
     pub(crate) fn mmio_read(&mut self, index: usize, offset: u32, size: u8, core: u8) -> u32 {
-        let mut ctx = self.mmio_ctx(core);
-        let value = self.external_mmio[index]
-            .device
-            .read(offset, size, &mut ctx);
-        self.raise_irqs_u64(ctx.raise_irqs);
-        value
+        self.with_mount(index, core, |d, ctx| d.read(offset, size, ctx))
     }
 
     /// Route a write to mount `index`; raises the IRQs it asks for.
@@ -267,22 +330,16 @@ impl Bus {
         alias: u32,
         core: u8,
     ) {
-        let mut ctx = self.mmio_ctx(core);
-        self.external_mmio[index]
-            .device
-            .write(offset, value, size, alias, &mut ctx);
-        self.raise_irqs_u64(ctx.raise_irqs);
+        self.with_mount(index, core, |d, ctx| {
+            d.write(offset, value, size, alias, ctx)
+        });
     }
 
     /// Quantum-end tick for every mount. Called from `tick_peripherals`.
     pub(crate) fn tick_mmio(&mut self, sys_clks: u32) {
-        let mut raise = 0u64;
         for i in 0..self.external_mmio.len() {
-            let mut ctx = self.mmio_ctx(0);
-            self.external_mmio[i].device.tick(sys_clks, &mut ctx);
-            raise |= ctx.raise_irqs;
+            self.with_mount(i, 0, |d, ctx| d.tick(sys_clks, ctx));
         }
-        self.raise_irqs_u64(raise);
     }
 }
 
@@ -412,6 +469,54 @@ mod tests {
                 core: 0
             })
         );
+    }
+
+    /// A stand-in for an external flash chip: a write of `v` to offset 0
+    /// programs the halfword `v` at flash offset 0; a read of offset 4
+    /// returns the flash word at offset 0 as the device sees it.
+    struct FlashChip;
+
+    impl MmioDevice for FlashChip {
+        fn read(&mut self, offset: u32, _: u8, ctx: &mut MmioCtx) -> u32 {
+            let f = ctx.flash();
+            match offset {
+                4 => u32::from_le_bytes(f[0..4].try_into().unwrap()),
+                _ => f.len() as u32,
+            }
+        }
+
+        fn write(&mut self, offset: u32, value: u32, _: u8, _: u32, ctx: &mut MmioCtx) {
+            if offset == 0 {
+                assert_eq!(ctx.write_flash(0, &(value as u16).to_le_bytes()), 2);
+            }
+        }
+    }
+
+    /// A device programming flash through its context changes what the
+    /// core fetches next: the decoded `movs r0, #1` at 0x1000_0000 is
+    /// dropped and the rewritten `movs r0, #2` runs.
+    #[test]
+    fn device_flash_writes_reach_the_xip_path_and_the_decode_cache() {
+        let mut emu = Emulator::new(Config::default());
+        let mut image = vec![0xFFu8; 0x1000];
+        image[0..4].copy_from_slice(&[0x01, 0x20, 0xFE, 0xE7]); // movs r0,#1; b .
+        emu.load_flash(&image);
+        emu.core_mut(1).halt();
+        let h = emu
+            .mount_mmio(BASE, 0x10, MmioAliasing::Atomic, FlashChip)
+            .unwrap();
+        emu.core_mut(0).regs.set_pc(0x1000_0000);
+        emu.step().unwrap();
+        assert_eq!(emu.core(0).regs.r[0], 1);
+
+        assert_eq!(emu.mmio_read32(BASE), 0x1000, "the device sees the backing");
+        emu.mmio_write32(BASE, 0x2002); // movs r0, #2
+        assert_eq!(emu.mmio_read32(BASE + 4), 0xE7FE_2002);
+        assert_eq!(emu.bus.read16(0x1000_0000, 0), 0x2002, "XIP reads see it");
+        emu.core_mut(0).regs.set_pc(0x1000_0000);
+        emu.step().unwrap();
+        assert_eq!(emu.core(0).regs.r[0], 2, "no stale decoded op");
+        let _ = h;
     }
 
     #[test]

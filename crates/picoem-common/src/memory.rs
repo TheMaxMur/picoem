@@ -180,6 +180,12 @@ impl Memory {
         n
     }
 
+    /// The whole XIP backing, for a host-side flash model that reads it
+    /// (empty until flash is loaded).
+    pub fn xip_bytes(&self) -> &[u8] {
+        &self.xip
+    }
+
     pub fn xip_read8(&self, offset: u32) -> u8 {
         self.xip.get(offset as usize).copied().unwrap_or(0)
     }
