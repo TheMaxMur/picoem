@@ -6817,11 +6817,10 @@ fn tt_sau_region_nsc() {
     // Configure SAU region 0 as NSC (Non-Secure Callable)
     let (mut c, mut bus) = core_and_bus();
     c.ppb.sau_ctrl = 1;
-    // Region 0: base=0x1000, limit=0x1FFF, NSC=1, enabled
-    // RBAR = 0x1000, RLAR = 0x1FE0 | 0x3 (NSC=1, enable=1)
-    c.ppb.sau_regions[0] = (0x1000, 0x1FE3);
+    // Region 0: base=0x2000_1000, limit=0x2000_1FFF, NSC=1, enabled
+    c.ppb.sau_regions[0] = (0x2000_1000, 0x2000_1FE3);
 
-    c.set_reg(1, 0x1500); // address in range (secure ROM range)
+    c.set_reg(1, 0x2000_1500); // SRAM: the IDAU leaves it to the SAU
     // TT R0, R1: hw0=0xE841, hw1=0xF000
     c.execute_one_wide_with_bus(0xE841, 0xF000, &mut bus);
     let result = c.reg(0);
@@ -6830,11 +6829,10 @@ fn tt_sau_region_nsc() {
     assert_eq!((result >> 8) & 0xFF, 0, "SREGION should be 0");
     // SRVALID = bit 17
     assert_ne!(result & (1 << 17), 0, "SRVALID should be set");
-    // NSC region: S should be 0 (non-secure callable)
-    assert_eq!(result & (1 << 22), 0, "S bit should be clear for NSC");
-    // NSR and NSRW should be set for NSC region
-    assert_ne!(result & (1 << 20), 0, "NSR bit should be set for NSC");
-    assert_ne!(result & (1 << 21), 0, "NSRW bit should be set for NSC");
+    // Non-secure callable memory is Secure: S set, no Non-secure access.
+    assert_ne!(result & (1 << 22), 0, "S bit should be set for NSC");
+    assert_eq!(result & (1 << 20), 0, "NSR bit should be clear for NSC");
+    assert_eq!(result & (1 << 21), 0, "NSRW bit should be clear for NSC");
 }
 
 #[test]
@@ -6854,9 +6852,9 @@ fn tt_sau_no_match_allns_clear() {
 
 #[test]
 fn tt_sau_no_match_allns_set() {
-    // SAU enabled, no regions match, ALLNS=1 -> Non-Secure
+    // SAU disabled, ALLNS=1 -> Non-Secure (ALLNS only acts with the SAU off)
     let (mut c, mut bus) = core_and_bus();
-    c.ppb.sau_ctrl = 3; // enable + ALLNS
+    c.ppb.sau_ctrl = 2; // disabled + ALLNS
 
     c.set_reg(3, 0xFFFF_0000);
     // TT R0, R3: hw0=0xE843, hw1=0xF000
@@ -6894,9 +6892,32 @@ fn tt_bootrom_scenario() {
     assert_ne!(result & (1 << 17), 0, "SRVALID");
     // S = 1
     assert_ne!(result & (1 << 22), 0, "S");
-    // IDAU bits: bit 23 (IRVALID) and bit 25 (RP2350 exempt)
+    // IDAU: IRVALID (bit 23) and IREGION 2 (bits 31:24), the NSC veneers
     assert_ne!(result & (1 << 23), 0, "IRVALID (IDAU region valid)");
-    assert_ne!(result & (1 << 25), 0, "RP2350 IDAU exempt bit");
+    assert_eq!(result >> 24, 2, "IREGION 2");
+}
+
+/// The bootrom's own expectation for exempt ROM ("everything else in the
+/// bootrom returns 004c0000", arm8_bootrom_rt0.S), and from Non-secure
+/// state no security attribution at all.
+#[test]
+fn tt_exempt_rom_and_ns_state_reports() {
+    let (mut c, mut bus) = core_and_bus();
+    c.ppb.sau_ctrl = 1;
+    c.ppb.sau_regions[7] = (0x4787, 0x7FE1);
+    c.set_reg(5, 0x0000_1234);
+    c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
+    assert_eq!(c.reg(2), 0x004C_0000);
+    c.transition_to_nonsecure();
+    for addr in [0x0000_1234, 0x0000_7FE1, 0x2000_0000] {
+        c.set_reg(5, addr);
+        c.execute_one_wide_with_bus(0xE845, 0xF200, &mut bus);
+        assert_eq!(
+            c.reg(2) & 0xFFFE_FF00,
+            0x000C_0000,
+            "{addr:#x} from NS: R/RW only"
+        );
+    }
 }
 
 #[test]
@@ -20068,15 +20089,18 @@ mod stage7_exceptions_coverage {
         assert_ne!(r & (1 << 19), 0); // RW
     }
 
-    // SAU enabled, unmatched, ALLNS=1 → NS fallback.
+    // SAU disabled with ALLNS=1 → Non-secure (ALLNS has no effect while
+    // the SAU is enabled). SRAM: the IDAU leaves it to the SAU.
     #[test]
     fn tt_sau_unmatched_allns_ns_fallback() {
         let mut cpu = CortexM33::for_test(0);
-        cpu.ppb.sau_ctrl = 1 | 2; // SAU enable + ALLNS
-        let r = cpu.execute_tt(0x5000_0000);
+        cpu.ppb.sau_ctrl = 2; // SAU disabled, ALLNS
+        let r = cpu.execute_tt(0x2000_0000);
         // NSR=bit20, NSRW=bit21 should be set.
         assert_ne!(r & (1 << 20), 0);
         assert_ne!(r & (1 << 21), 0);
+        cpu.ppb.sau_ctrl = 3; // enabled: no region matches, so Secure
+        assert_ne!(cpu.execute_tt(0x2000_0000) & (1 << 22), 0);
     }
 
     // SAU enabled, unmatched, ALLNS=0 → S fallback.
@@ -20084,88 +20108,77 @@ mod stage7_exceptions_coverage {
     fn tt_sau_unmatched_allns0_s_fallback() {
         let mut cpu = CortexM33::for_test(0);
         cpu.ppb.sau_ctrl = 1;
-        let r = cpu.execute_tt(0x5000_0000);
+        let r = cpu.execute_tt(0x2000_0000);
         assert_ne!(r & (1 << 22), 0); // S bit
     }
 
-    // SAU matched NSC=1 → NS region.
+    // SAU region with NSC=1: Non-secure callable, which is Secure memory —
+    // S set, no Non-secure access. NSC=0 marks it Non-secure.
     #[test]
     fn tt_sau_matched_nsc_ns() {
         let mut cpu = CortexM33::for_test(0);
         cpu.ppb.sau_ctrl = 1;
-        // Region 0 covers 0x5000_0000..0x5000_FFFF, NSC=1, EN=1.
+        // Region 0 covers 0x2000_0000..0x2000_FFFF, NSC=1, EN=1.
         // RLAR layout: [limit] | (NSC<<1) | EN.
-        cpu.ppb.sau_regions[0] = (0x5000_0000, 0x5000_FFE0 | (1 << 1) | 1);
-        let r = cpu.execute_tt(0x5000_0000);
+        cpu.ppb.sau_regions[0] = (0x2000_0000, 0x2000_FFE0 | (1 << 1) | 1);
+        let r = cpu.execute_tt(0x2000_0000);
+        assert_ne!(r & (1 << 22), 0); // S
+        assert_eq!(r & (3 << 20), 0); // no NSR / NSRW
+        cpu.ppb.sau_regions[0].1 &= !(1 << 1);
+        let r = cpu.execute_tt(0x2000_0000);
+        assert_eq!(r & (1 << 22), 0);
         assert_ne!(r & (1 << 20), 0); // NSR
     }
 
-    // IDAU check: addresses in 0xE, 0xD, 0x4, etc.
+    // IDAU: Exempt ranges report no region and take the current state
+    // (Secure here); the SG veneers are IDAU region 2, Non-secure callable.
     #[test]
     fn tt_idau_various_ranges() {
         let cpu = CortexM33::for_test(0);
-        let r_ppb = cpu.execute_tt(0xE000_0000);
-        assert_ne!(r_ppb & (1 << 23), 0, "IRVALID for PPB");
-        let r_rom_ns = cpu.execute_tt(0x0000_8001);
-        // ROM alias above 0x8000 is NS → IDAU returns 0.
-        assert_eq!(r_rom_ns & (1 << 25), 0);
-        let r_unknown = cpu.execute_tt(0x7000_0000);
-        assert_eq!(r_unknown & (1 << 25), 0);
+        for addr in [
+            0x0000_0000,
+            0x0000_7DFC,
+            0x4000_0000,
+            0x5010_0000,
+            0xD000_0000,
+            0xE000_ED00,
+        ] {
+            assert_eq!(
+                cpu.execute_tt(addr) & 0xFF7F_0000,
+                0x004C_0000,
+                "{addr:#x} exempt"
+            );
+        }
+        let sg = cpu.execute_tt(0x0000_7E00);
+        assert_eq!(sg >> 23, (2 << 1) | 1, "IREGION 2, IRVALID");
+        assert_ne!(sg & (1 << 22), 0, "NSC is Secure");
     }
 
-    /// Exhaustive IDAU sweep — verifies the secure/non-secure
-    /// classification for every high-nibble in 0x0..=0xF. Catches
-    /// `delete match arm 0xN` mutations on `rp2350_idau` and the
-    /// `addr < 0x0000_8000` boundary mutation on the 0x0 arm. Driven
-    /// by the bit-23 (IRVALID-secure) and bit-25 (RP2350 exempt) flags
-    /// which the IDAU sets together for recognized secure regions.
+    /// Exhaustive IDAU sweep over the high nibble: the peripherals, SIO and
+    /// the PPB are Exempt (Secure to Secure state whatever the SAU says);
+    /// everything else outside the ROM follows the SAU.
     #[test]
     fn tt_idau_full_high_nibble_sweep() {
-        let cpu = CortexM33::for_test(0);
-        // Secure-classified prefixes per rp2350_idau dispatch table:
-        //   0x0 (low 32K), 0x1 XIP, 0x2/0x3 SRAM, 0x4/0x5 peripherals,
-        //   0xD SIO, 0xE PPB.
-        // Use 0x10 offset within each prefix to avoid the special low
-        // 0x0 boundary; for 0x0 itself we test both halves below.
-        let secure_prefixes: [u32; 8] = [0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0xD, 0xE];
-        let nonsecure_prefixes: [u32; 8] = [0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xF];
-
-        for prefix in secure_prefixes {
-            let addr = (prefix << 28) | 0x0010; // small offset, away from boundary
-            let r = cpu.execute_tt(addr);
-            assert_ne!(
-                r & (1 << 23),
-                0,
-                "prefix 0x{prefix:X} should be IRVALID-secure (IDAU bit 23)"
-            );
-            assert_ne!(
-                r & (1 << 25),
-                0,
-                "prefix 0x{prefix:X} should be RP2350-exempt (IDAU bit 25)"
-            );
-        }
-        for prefix in nonsecure_prefixes {
+        let mut cpu = CortexM33::for_test(0);
+        cpu.ppb.sau_ctrl = 2; // SAU off, ALLNS: SAU-decided memory is NS
+        for prefix in 0x1..=0xFu32 {
             let addr = (prefix << 28) | 0x0010;
             let r = cpu.execute_tt(addr);
+            let exempt = matches!(prefix, 0x4 | 0x5 | 0xD | 0xE);
             assert_eq!(
-                r & (1 << 25),
-                0,
-                "prefix 0x{prefix:X} should NOT be RP2350-exempt"
+                r & (1 << 22) != 0,
+                exempt,
+                "prefix 0x{prefix:X}: S only when exempt"
             );
+            assert_eq!(r & (1 << 23), 0, "prefix 0x{prefix:X}: no IDAU region");
         }
-
-        // 0x0 boundary: addr < 0x8000 secure; addr >= 0x8000 non-secure.
-        let r_lo = cpu.execute_tt(0x0000_7FFF);
-        assert_ne!(
-            r_lo & (1 << 25),
-            0,
-            "0x0000_7FFF (lower 32K) should be exempt"
-        );
-        let r_hi = cpu.execute_tt(0x0000_8000);
+        // ROM: exempt up to 0x7DFF, NSC above.
+        assert_eq!(cpu.execute_tt(0x0000_7DFF) & (1 << 23), 0);
+        assert_ne!(cpu.execute_tt(0x0000_7E00) & (1 << 23), 0);
         assert_eq!(
-            r_hi & (1 << 25),
+            cpu.execute_tt(0x0000_8000) & (1 << 22),
             0,
-            "0x0000_8000 (upper 32K) should NOT be exempt"
+            "past the ROM: SAU, ALLNS"
         );
     }
 
