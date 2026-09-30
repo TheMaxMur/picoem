@@ -2520,6 +2520,37 @@ mod stage5_lib_residue {
         assert_eq!(c.regs.r[2], 0x2000_4000);
     }
 
+    /// Secure code reaches the Non-secure bank through the SCS alias at
+    /// 0xE002_E000 (the bootrom installs the Non-secure VTOR and MPU this
+    /// way); to Non-secure code the alias reads as zero and ignores writes.
+    #[test]
+    fn scs_ns_alias_reaches_the_ns_bank_from_secure_only() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.memory.sram_write16(0, 0x6001); // str r1, [r0]
+        emu.bus.memory.sram_write16(2, 0x6802); // ldr r2, [r0]
+        emu.bus.memory.sram_write16(4, 0xE7FE); // b .
+        emu.core_mut(1).halt();
+        let c = emu.core_mut(0);
+        c.ppb.vtor = 0x1000_0000;
+        c.regs.r[0] = 0xE002_ED08;
+        c.regs.r[1] = 0x0000_4A00;
+        c.regs.set_pc(0x2000_0000);
+        emu.step().unwrap();
+        let c = emu.core(0);
+        assert_eq!((c.ppb.vtor, c.ppb.ns.vtor), (0x1000_0000, 0x4A00));
+        assert_eq!(c.regs.r[2], 0x4A00);
+
+        let c = emu.core_mut(0);
+        c.regs.r[1] = 0x2000_0000;
+        c.regs.r[2] = 0xFFFF_FFFF;
+        c.regs.set_pc(0x2000_0000);
+        c.transition_to_nonsecure();
+        emu.step().unwrap();
+        let c = emu.core(0);
+        assert_eq!(c.ppb.ns.vtor, 0x4A00, "NS writes to the alias are ignored");
+        assert_eq!(c.regs.r[2], 0, "and it reads as zero");
+    }
+
     /// Firmware pending an interrupt through STIR (as CMSIS
     /// `NVIC::request` does) gets its handler taken.
     #[test]

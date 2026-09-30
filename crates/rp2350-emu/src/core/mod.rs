@@ -239,6 +239,12 @@ impl CoreCounters {
     }
 }
 
+/// The System Control Space (ARMv8-M §D1.1).
+const SCS_BASE: u32 = 0xE000_E000;
+/// Its Non-secure alias: Secure state reaches the Non-secure bank here;
+/// to Non-secure state it reads as zero and ignores writes.
+const SCS_NS_ALIAS: std::ops::Range<u32> = 0xE002_E000..0xE002_F000;
+
 /// Cortex-M33 CPU core.
 pub struct CortexM33 {
     pub regs: Registers,
@@ -833,8 +839,16 @@ impl CortexM33 {
     }
 
     /// A read of the SCS as this core's security state sees it: from
-    /// Non-secure state the Security Extension's Non-secure bank.
+    /// Non-secure state the Security Extension's Non-secure bank, which
+    /// Secure state reaches through the alias at 0xE002_E000.
     fn ppb_read32(&mut self, addr: u32) -> u32 {
+        if SCS_NS_ALIAS.contains(&addr) {
+            return if self.secure {
+                self.ppb.read32_ns(addr)
+            } else {
+                0
+            };
+        }
         if self.secure {
             self.ppb.read32(addr)
         } else {
@@ -844,6 +858,12 @@ impl CortexM33 {
 
     /// A write to the SCS as this core's security state sees it.
     fn ppb_write32(&mut self, addr: u32, val: u32) {
+        if SCS_NS_ALIAS.contains(&addr) {
+            if self.secure {
+                self.ppb.write32_ns(addr, val);
+            }
+            return;
+        }
         if self.secure {
             self.ppb.write32(addr, val);
         } else {
@@ -995,7 +1015,10 @@ impl CortexM33 {
     /// byte-accessible, which is how CMSIS `NVIC_SetPriority` (and
     /// embassy's `set_priority`) write a priority.
     fn is_byte_accessible_ppb(addr: u32) -> bool {
-        matches!(addr, 0xE000_E400..=0xE000_E5EF | 0xE000_ED18..=0xE000_ED23)
+        matches!(
+            addr & !(SCS_NS_ALIAS.start - SCS_BASE),
+            0xE000_E400..=0xE000_E5EF | 0xE000_ED18..=0xE000_ED23
+        )
     }
 
     pub(crate) fn bus_write8<B: CoreBus>(&mut self, addr: u32, val: u8, bus: &mut B) {
