@@ -30514,11 +30514,12 @@ mod stage4_lib_residue_v2 {
         // so it doesn't perform any work that affects the assertion.
         emu.bus.atomics.set_wfe_waiting(0);
         emu.bus.atomics.set_halted(1);
-        let pre_cycles_core0 = emu.cores.expect_arm()[0].cycles;
+        let pre_pc_core0 = emu.cores.expect_arm()[0].regs.pc();
         let _ = emu.step().unwrap();
-        // Core 0 is parked → its cycle counter must be unchanged.
-        let post_cycles_core0 = emu.cores.expect_arm()[0].cycles;
-        assert_eq!(pre_cycles_core0, post_cycles_core0);
+        // Core 0 is parked → it runs nothing, and sleeps through the
+        // quantum on the chip's clock.
+        assert_eq!(emu.cores.expect_arm()[0].regs.pc(), pre_pc_core0);
+        assert_eq!(emu.cores.expect_arm()[0].cycles, emu.cycles());
     }
 
     // ------------------- run_pair_arm: exclusive-monitor snoop (line 1477) -------------------

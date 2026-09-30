@@ -1570,6 +1570,13 @@ fn step_pair_arm(cs: &mut [CortexM33; 2], bus: &mut Bus, target: u64) {
                 bus.pending_invalidation_regions = 0;
             }
         }
+        // A parked core (WFE, WFI, held) sleeps through the rest of the
+        // quantum: its clock keeps pace with the chip's, so on waking it
+        // resumes in step instead of replaying the sleep as a burst.
+        if (cs[core_id].is_halted() || cs[core_id].is_wfe_waiting()) && cs[core_id].cycles < target
+        {
+            cs[core_id].cycles = target;
+        }
         // Final refresh so any post-quantum inspection (e.g. tests
         // reading DWT_CYCCNT between steps) sees a current base.
         let cyc = cs[core_id].cycles;
@@ -2452,6 +2459,44 @@ mod stage5_lib_residue {
         assert_eq!(emu.core(0).regs.ipsr(), 16 + 3, "the IRQ is then taken");
     }
 
+    /// A parked core sleeps in step with the chip. Woken after a long
+    /// WFE it resumes one quantum at a time; it must not replay the
+    /// sleep as a burst of instructions that takes no emulated time
+    /// (the burst ran an embassy IRQ handler and executor poll inside a
+    /// single cycle of the master clock).
+    #[test]
+    fn a_woken_core_does_not_replay_its_sleep() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.memory.sram_write16(0, 0xBF20); // wfe
+        emu.bus.memory.sram_write16(2, 0x3001); // adds r0, #1
+        emu.bus.memory.sram_write16(4, 0xE7FD); // b <adds>
+        emu.core_mut(1).halt();
+        let c = emu.core_mut(0);
+        c.regs.msp = 0x2000_1000;
+        c.regs.r[13] = 0x2000_1000;
+        c.regs.r[0] = 0;
+        c.regs.set_pc(0x2000_0000);
+        emu.step().unwrap();
+        assert!(emu.bus.atomics.is_wfe_waiting(0));
+        for _ in 0..1000 {
+            emu.step().unwrap();
+        }
+        assert_eq!(
+            emu.core(0).cycles(),
+            emu.cycles(),
+            "asleep, the core keeps the chip's time"
+        );
+        emu.bus.atomics.set_event_flag(0);
+        emu.step().unwrap();
+        assert!(!emu.bus.atomics.is_wfe_waiting(0));
+        emu.step().unwrap();
+        let n = emu.core(0).regs.r[0];
+        assert!(
+            n > 0 && n <= emu.step_quantum,
+            "{n} loop iterations in one quantum"
+        );
+    }
+
     /// Firmware pending an interrupt through STIR (as CMSIS
     /// `NVIC::request` does) gets its handler taken.
     #[test]
@@ -2937,9 +2982,10 @@ mod stage8_lib_residue {
         let mut emu = Emulator::new(Config::default());
         emu.bus.atomics.set_wfe_waiting(1);
         emu.bus.atomics.set_halted(0);
-        let pre = emu.cores.expect_arm()[1].cycles;
+        let pre_pc = emu.cores.expect_arm()[1].regs.pc();
         let _ = emu.step().unwrap();
-        assert_eq!(emu.cores.expect_arm()[1].cycles, pre);
+        assert_eq!(emu.cores.expect_arm()[1].regs.pc(), pre_pc);
+        assert_eq!(emu.cores.expect_arm()[1].cycles, emu.cycles());
     }
 
     // ------------------- core_riscv accessor on RiscV emulator -------------------
