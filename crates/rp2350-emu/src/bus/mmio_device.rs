@@ -99,6 +99,8 @@ pub struct MmioCtx<'a> {
     /// The bus's flash backing; `None` in a context built outside a bus
     /// call (e.g. `MmioCtx::default()` in a device's own tests).
     flash: Option<FlashPort<'a>>,
+    /// Set by [`Self::bus_fault`].
+    fault: bool,
 }
 
 /// A mounted device's handle on the XIP flash backing.
@@ -120,6 +122,19 @@ impl MmioCtx<'_> {
     /// has no bus behind it).
     pub fn flash(&self) -> &[u8] {
         self.flash.as_ref().map_or(&[], |f| f.memory.xip_bytes())
+    }
+
+    /// End this access with a bus error: the issuing core takes a
+    /// precise BusFault (HardFault if BusFault is disabled), as for an
+    /// access the built-in bus rejects. A read's return value is then
+    /// ignored. Meaningless inside [`MmioDevice::tick`].
+    pub fn bus_fault(&mut self) {
+        self.fault = true;
+    }
+
+    /// Whether the device ended the access with [`Self::bus_fault`].
+    pub fn faulted(&self) -> bool {
+        self.fault
     }
 
     /// Overwrite flash bytes at `offset` in place, as an external flash
@@ -285,11 +300,13 @@ impl Bus {
     }
 
     /// Run `f` on mount `index` with a context that carries the flash
-    /// port, then raise the IRQs the device asked for.
+    /// port, then raise the IRQs the device asked for and, for a bus
+    /// access (`addr` is `Some`), the bus fault it asked for.
     fn with_mount<R>(
         &mut self,
         index: usize,
         core: u8,
+        addr: Option<u32>,
         f: impl FnOnce(&mut dyn MmioDevice, &mut MmioCtx) -> R,
     ) -> R {
         let (cycle, sys_clk_hz) = (self.master_cycle, self.clock_tree.sys_clk_hz);
@@ -308,29 +325,46 @@ impl Bus {
                 memory,
                 invalidation_regions: pending_invalidation_regions,
             }),
+            fault: false,
         };
         let r = f(external_mmio[index].device.as_mut(), &mut ctx);
-        let raise = ctx.raise_irqs;
+        let (raise, fault) = (ctx.raise_irqs, ctx.fault);
         self.raise_irqs_u64(raise);
+        if let (true, Some(addr)) = (fault, addr) {
+            self.atomics.set_bus_fault(core as usize, addr);
+        }
         r
     }
 
-    /// Route a read to mount `index`; raises the IRQs it asks for.
-    pub(crate) fn mmio_read(&mut self, index: usize, offset: u32, size: u8, core: u8) -> u32 {
-        self.with_mount(index, core, |d, ctx| d.read(offset, size, ctx))
+    /// Route a read of bus address `addr` to mount `index`; raises the
+    /// IRQs and the bus fault it asks for. A faulted read returns 0.
+    pub(crate) fn mmio_read(
+        &mut self,
+        index: usize,
+        addr: u32,
+        offset: u32,
+        size: u8,
+        core: u8,
+    ) -> u32 {
+        self.with_mount(index, core, Some(addr), |d, ctx| {
+            let v = d.read(offset, size, ctx);
+            if ctx.fault { 0 } else { v }
+        })
     }
 
-    /// Route a write to mount `index`; raises the IRQs it asks for.
+    /// Route a write of bus address `addr` to mount `index`; raises the
+    /// IRQs and the bus fault it asks for.
     pub(crate) fn mmio_write(
         &mut self,
         index: usize,
+        addr: u32,
         offset: u32,
         value: u32,
         size: u8,
         alias: u32,
         core: u8,
     ) {
-        self.with_mount(index, core, |d, ctx| {
+        self.with_mount(index, core, Some(addr), |d, ctx| {
             d.write(offset, value, size, alias, ctx)
         });
     }
@@ -338,7 +372,7 @@ impl Bus {
     /// Quantum-end tick for every mount. Called from `tick_peripherals`.
     pub(crate) fn tick_mmio(&mut self, sys_clks: u32) {
         for i in 0..self.external_mmio.len() {
-            self.with_mount(i, 0, |d, ctx| d.tick(sys_clks, ctx));
+            self.with_mount(i, 0, None, |d, ctx| d.tick(sys_clks, ctx));
         }
     }
 }
@@ -468,6 +502,74 @@ mod tests {
                 size: 4,
                 core: 0
             })
+        );
+    }
+
+    /// Answers reads, but ends any access at offset 8 with a bus error.
+    struct Guarded;
+
+    impl MmioDevice for Guarded {
+        fn read(&mut self, offset: u32, _: u8, ctx: &mut MmioCtx) -> u32 {
+            if offset == 8 {
+                ctx.bus_fault();
+            }
+            0x1234_5678
+        }
+
+        fn write(&mut self, offset: u32, _: u32, _: u8, _: u32, ctx: &mut MmioCtx) {
+            if offset == 8 {
+                ctx.bus_fault();
+            }
+        }
+    }
+
+    /// Run `ldr r0, [r1]` (or `str r0, [r1]`) at 0x2000_0000 with r1 = `addr`
+    /// and return core 0's IPSR afterwards.
+    fn ipsr_after_access(store: bool, addr: u32) -> (u32, u32) {
+        let mut emu = Emulator::new(Config::default());
+        emu.mount_mmio(BASE, 0x10, MmioAliasing::Atomic, Guarded)
+            .unwrap();
+        emu.core_mut(1).halt();
+        let op: u16 = if store { 0x6008 } else { 0x6808 }; // str/ldr r0, [r1]
+        emu.load_image(0x2000_0000, &[op as u8, (op >> 8) as u8, 0xFE, 0xE7]);
+        // Vector table in SRAM: every exception parks at a `b .`.
+        for v in 0..64u32 {
+            emu.poke(0x2000_1000 + v * 4, 0x2000_0003);
+        }
+        let c = emu.core_mut(0);
+        c.ppb.vtor = 0x2000_1000;
+        c.regs.msp = 0x2000_8000;
+        c.regs.r[13] = 0x2000_8000;
+        c.regs.r[1] = addr;
+        c.regs.set_pc(0x2000_0000);
+        for _ in 0..4 {
+            emu.step().unwrap();
+        }
+        (emu.core(0).regs.ipsr(), emu.core(0).regs.r[0])
+    }
+
+    #[test]
+    fn a_device_bus_fault_reaches_the_issuing_core() {
+        assert_eq!(
+            ipsr_after_access(false, BASE + 4).0,
+            0,
+            "a plain read completes"
+        );
+        assert_eq!(ipsr_after_access(false, BASE + 4).1, 0x1234_5678);
+        assert_eq!(
+            ipsr_after_access(false, BASE + 8).0,
+            3,
+            "a faulted read takes HardFault"
+        );
+        assert_eq!(
+            ipsr_after_access(true, BASE + 4).0,
+            0,
+            "a plain write completes"
+        );
+        assert_eq!(
+            ipsr_after_access(true, BASE + 8).0,
+            3,
+            "a faulted write takes HardFault"
         );
     }
 

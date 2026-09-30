@@ -1588,7 +1588,7 @@ impl Bus {
             && matches!(region, 0x4 | 0x5)
             && let Some((index, offset, _)) = self.find_mmio(addr)
         {
-            let val = self.mmio_read(index, offset, 1, core) as u8;
+            let val = self.mmio_read(index, addr, offset, 1, core) as u8;
             if self.mmio_trace_enabled {
                 self.emit_mmio_trace('R', 1, addr, val as u32, core);
             }
@@ -1800,7 +1800,7 @@ impl Bus {
             && matches!(region, 0x4 | 0x5)
             && let Some((index, offset, alias)) = self.find_mmio(addr)
         {
-            self.mmio_write(index, offset, val as u32, 1, alias, core);
+            self.mmio_write(index, addr, offset, val as u32, 1, alias, core);
             if self.mmio_trace_enabled {
                 self.emit_mmio_trace('W', 1, addr, val as u32, core);
             }
@@ -2372,7 +2372,7 @@ impl Bus {
             && matches!(region, 0x4 | 0x5)
             && let Some((index, offset, _)) = self.find_mmio(addr)
         {
-            let val = self.mmio_read(index, offset, 2, core) as u16;
+            let val = self.mmio_read(index, addr, offset, 2, core) as u16;
             if self.mmio_trace_enabled {
                 self.emit_mmio_trace('R', 2, addr, val as u32, core);
             }
@@ -2599,7 +2599,7 @@ impl Bus {
             && matches!(region, 0x4 | 0x5)
             && let Some((index, offset, alias)) = self.find_mmio(addr)
         {
-            self.mmio_write(index, offset, val as u32, 2, alias, core);
+            self.mmio_write(index, addr, offset, val as u32, 2, alias, core);
             if self.mmio_trace_enabled {
                 self.emit_mmio_trace('W', 2, addr, val as u32, core);
             }
@@ -3075,7 +3075,7 @@ impl Bus {
             && matches!(region, 0x4 | 0x5)
             && let Some((index, offset, _)) = self.find_mmio(addr)
         {
-            let val = self.mmio_read(index, offset, 4, core);
+            let val = self.mmio_read(index, addr, offset, 4, core);
             if self.mmio_trace_enabled {
                 self.emit_mmio_trace('R', 4, addr, val, core);
             }
@@ -3229,7 +3229,7 @@ impl Bus {
             && matches!(region, 0x4 | 0x5)
             && let Some((index, offset, alias)) = self.find_mmio(addr)
         {
-            self.mmio_write(index, offset, val, 4, alias, core);
+            self.mmio_write(index, addr, offset, val, 4, alias, core);
             if self.mmio_trace_enabled {
                 self.emit_mmio_trace('W', 4, addr, val, core);
             }
