@@ -779,6 +779,14 @@ impl Bus {
         (0x1C00_0000..0x1C00_4000).contains(&addr)
     }
 
+    /// The XIP cache used as SRAM, at its datasheet address (pico-sdk
+    /// `XIP_SRAM_BASE`..`XIP_SRAM_END`). The bootrom clears it with word
+    /// stores before entering the USB bootloader. Same 16 KB as picoem's
+    /// older 0x1C00_0000 scratch window.
+    fn is_xip_sram_window(addr: u32) -> bool {
+        (0x13FF_C000..0x1400_0000).contains(&addr)
+    }
+
     /// Flash byte offset behind an XIP read with loaded flash. The cached
     /// window (0x1000_0000), the uncached no-allocate one (0x1400_0000) and
     /// the untranslated one (0x1C00_0000) all see chip-select 0's 16 MB
@@ -796,25 +804,25 @@ impl Bus {
     }
 
     fn xip_sram_read8(&self, addr: u32) -> u8 {
-        self.xip_sram[(addr - 0x1C00_0000) as usize]
+        self.xip_sram[(addr & 0x3FFF) as usize]
     }
 
     fn xip_sram_write8(&mut self, addr: u32, val: u8) {
-        self.xip_sram[(addr - 0x1C00_0000) as usize] = val;
+        self.xip_sram[(addr & 0x3FFF) as usize] = val;
     }
 
     fn xip_sram_read16(&self, addr: u32) -> u16 {
-        let off = (addr - 0x1C00_0000) as usize;
+        let off = (addr & 0x3FFF) as usize;
         u16::from_le_bytes([self.xip_sram[off], self.xip_sram[off + 1]])
     }
 
     fn xip_sram_write16(&mut self, addr: u32, val: u16) {
-        let off = (addr - 0x1C00_0000) as usize;
+        let off = (addr & 0x3FFF) as usize;
         self.xip_sram[off..off + 2].copy_from_slice(&val.to_le_bytes());
     }
 
     fn xip_sram_read32(&self, addr: u32) -> u32 {
-        let off = (addr - 0x1C00_0000) as usize;
+        let off = (addr & 0x3FFF) as usize;
         u32::from_le_bytes([
             self.xip_sram[off],
             self.xip_sram[off + 1],
@@ -824,7 +832,7 @@ impl Bus {
     }
 
     fn xip_sram_write32(&mut self, addr: u32, val: u32) {
-        let off = (addr - 0x1C00_0000) as usize;
+        let off = (addr & 0x3FFF) as usize;
         self.xip_sram[off..off + 4].copy_from_slice(&val.to_le_bytes());
     }
 
@@ -1601,7 +1609,11 @@ impl Bus {
         };
         let val = match region {
             0x0 if offset < 0x8000 => self.memory.rom_read8(offset),
-            0x1 if Self::is_xip_sram(addr) && !self.flash_loaded => self.xip_sram_read8(addr),
+            0x1 if Self::is_xip_sram_window(addr)
+                || (Self::is_xip_sram(addr) && !self.flash_loaded) =>
+            {
+                self.xip_sram_read8(addr)
+            }
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -1809,7 +1821,7 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
-            0x1 if Self::is_xip_sram(addr) => {
+            0x1 if Self::is_xip_sram_window(addr) || Self::is_xip_sram(addr) => {
                 self.xip_sram_write8(addr, val);
                 self.invalidate_pc_range(addr, 1);
             }
@@ -2385,7 +2397,11 @@ impl Bus {
         };
         let val = match region {
             0x0 if offset + 1 < 0x8000 => self.memory.rom_read16(offset),
-            0x1 if Self::is_xip_sram(addr) && !self.flash_loaded => self.xip_sram_read16(addr),
+            0x1 if Self::is_xip_sram_window(addr)
+                || (Self::is_xip_sram(addr) && !self.flash_loaded) =>
+            {
+                self.xip_sram_read16(addr)
+            }
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -2608,7 +2624,7 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
-            0x1 if Self::is_xip_sram(addr) => {
+            0x1 if Self::is_xip_sram_window(addr) || Self::is_xip_sram(addr) => {
                 self.xip_sram_write16(addr, val);
                 self.invalidate_pc_range(addr, 2);
             }
@@ -3088,7 +3104,11 @@ impl Bus {
         };
         let val = match region {
             0x0 if offset + 3 < 0x8000 => self.memory.rom_read32(offset),
-            0x1 if Self::is_xip_sram(addr) && !self.flash_loaded => self.xip_sram_read32(addr),
+            0x1 if Self::is_xip_sram_window(addr)
+                || (Self::is_xip_sram(addr) && !self.flash_loaded) =>
+            {
+                self.xip_sram_read32(addr)
+            }
             0x1 => {
                 if !self.flash_loaded {
                     self.atomics.set_bus_fault(core as usize, addr);
@@ -3238,7 +3258,7 @@ impl Bus {
 
         let offset = addr & 0x00FF_FFFF;
         match region {
-            0x1 if Self::is_xip_sram(addr) => {
+            0x1 if Self::is_xip_sram_window(addr) || Self::is_xip_sram(addr) => {
                 self.xip_sram_write32(addr, val);
                 self.invalidate_pc_range(addr, 4);
             }
@@ -4011,6 +4031,27 @@ mod xip_window_tests {
             0,
             "the probe word must not be 0"
         );
+    }
+
+    /// XIP_SRAM_BASE (0x13FF_C000): the bootrom's nsboot entry clears all
+    /// 16 KB with word stores; with or without flash the window is RAM for
+    /// every width and never faults.
+    #[test]
+    fn xip_sram_lives_at_its_datasheet_address() {
+        for with_flash in [false, true] {
+            let mut bus = if with_flash {
+                bus_with_flash(0x1000)
+            } else {
+                Bus::new()
+            };
+            bus.write32(0x13FF_C000, 0x1122_3344, 0);
+            bus.write16(0x13FF_FFFC, 0xBEEF, 0);
+            bus.write8(0x13FF_FFFF, 0x5A, 0);
+            assert!(!bus.atomics.is_bus_fault(0), "flash loaded: {with_flash}");
+            assert_eq!(bus.read32(0x13FF_C000, 0), 0x1122_3344);
+            assert_eq!(bus.read16(0x13FF_FFFC, 0), 0xBEEF);
+            assert_eq!(bus.read8(0x13FF_FFFF, 0), 0x5A);
+        }
     }
 
     /// Without flash the 0x1C00_0000 window keeps serving picoem's XIP
