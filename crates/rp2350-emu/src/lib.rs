@@ -2551,6 +2551,149 @@ mod stage5_lib_residue {
         assert_eq!(c.regs.r[2], 0, "and it reads as zero");
     }
 
+    /// Two worlds on core 0: thread code `b .` at 0x2000_0000; IRQ 3
+    /// handlers that spin (`b .`, Secure at 0x2000_0100, Non-secure at
+    /// 0x2000_0180) with a `bx lr` 16 bytes after each; Secure VTOR
+    /// 0x2000_0200, Non-secure VTOR 0x2000_0400; MSP_S 0x2000_1000,
+    /// MSP_NS 0x2000_2000; IRQ 3 enabled, targeting Non-secure if asked.
+    fn emu_two_worlds(irq3_ns: bool) -> Emulator {
+        let mut emu = Emulator::new(Config::default());
+        let m = &mut emu.bus.memory;
+        for (at, op) in [
+            (0x000, 0xE7FE),
+            (0x100, 0xE7FE),
+            (0x110, 0x4770),
+            (0x180, 0xE7FE),
+            (0x190, 0x4770),
+        ] {
+            m.sram_write16(at, op);
+        }
+        m.sram_write32(0x200 + 4 * (16 + 3), 0x2000_0101);
+        m.sram_write32(0x400 + 4 * (16 + 3), 0x2000_0181);
+        emu.core_mut(1).halt();
+        let c = emu.core_mut(0);
+        c.ppb.vtor = 0x2000_0200;
+        c.ppb.ns.vtor = 0x2000_0400;
+        c.regs.msp = 0x2000_1000;
+        c.regs.r[13] = 0x2000_1000;
+        c.regs.msp_ns = 0x2000_2000;
+        c.regs.set_pc(0x2000_0000);
+        c.ppb.nvic_itns[0] = (irq3_ns as u32) << 3;
+        emu.mmio_write32(0xE000_E100, 1 << 3);
+        emu
+    }
+
+    /// Step until IRQ 3's handler is running, then return from it.
+    fn take_irq3_then_return(emu: &mut Emulator, handler: u32) -> (u32, bool, u32) {
+        emu.bus.assert_irq_shared(3);
+        for _ in 0..4 {
+            emu.step().unwrap();
+        }
+        let c = emu.core(0);
+        assert_eq!(
+            (c.regs.ipsr(), c.regs.pc()),
+            (16 + 3, handler),
+            "in the handler"
+        );
+        let seen = (c.regs.lr(), c.secure, c.regs.r[13]);
+        emu.core_mut(0).regs.set_pc(handler + 0x10); // bx lr
+        for _ in 0..4 {
+            emu.step().unwrap();
+        }
+        assert_eq!(emu.core(0).regs.ipsr(), 0, "back in thread mode");
+        seen
+    }
+
+    /// Non-secure thread, Non-secure IRQ: vectored through the Non-secure
+    /// table, framed on the Non-secure MSP, EXC_RETURN 0xFFFF_FFB8 (S=0,
+    /// ES=0), and back to Non-secure thread mode.
+    #[test]
+    fn ns_irq_in_ns_state_uses_the_ns_vector_table() {
+        let mut emu = emu_two_worlds(true);
+        emu.core_mut(0).transition_to_nonsecure();
+        let (lr, secure, sp) = take_irq3_then_return(&mut emu, 0x2000_0180);
+        assert_eq!((lr, secure, sp), (0xFFFF_FFB8, false, 0x2000_2000 - 32));
+        let c = emu.core(0);
+        assert!(!c.secure);
+        assert_eq!((c.regs.pc(), c.regs.r[13]), (0x2000_0000, 0x2000_2000));
+    }
+
+    /// Secure thread, Non-secure IRQ: the basic frame and the additional
+    /// state context (integrity signature, R4-R11) go on the Secure MSP,
+    /// the registers are cleared for the Non-secure handler (EXC_RETURN
+    /// 0xFFFF_FFD8: S=1, DCRS=0, ES=0), and the return restores them.
+    #[test]
+    fn ns_irq_from_secure_state_stacks_and_clears_the_callee_registers() {
+        let mut emu = emu_two_worlds(true);
+        for i in 4..12 {
+            emu.core_mut(0).regs.r[i] = 0x4400 + i as u32;
+        }
+        emu.bus.assert_irq_shared(3);
+        for _ in 0..4 {
+            emu.step().unwrap();
+        }
+        let c = emu.core(0);
+        assert_eq!(
+            (c.regs.ipsr(), c.regs.pc(), c.secure),
+            (16 + 3, 0x2000_0180, false)
+        );
+        assert_eq!(c.regs.lr(), 0xFFFF_FFD8);
+        assert!(
+            c.regs.r[4..12].iter().all(|&r| r == 0),
+            "callee registers cleared"
+        );
+        assert_eq!(c.regs.r[13], 0x2000_2000, "the handler runs on MSP_NS");
+        let frame = 0x2000_1000 - 32 - 0x28;
+        assert_eq!(emu.peek(frame), 0xFEFA_125B, "integrity signature");
+        assert_eq!(emu.peek(frame + 8), 0x4404, "R4 stacked");
+        emu.core_mut(0).regs.set_pc(0x2000_0190);
+        for _ in 0..4 {
+            emu.step().unwrap();
+        }
+        let c = emu.core(0);
+        assert!(c.secure);
+        assert_eq!(
+            (c.regs.ipsr(), c.regs.pc(), c.regs.r[13]),
+            (0, 0x2000_0000, 0x2000_1000)
+        );
+        assert!(
+            (4..12).all(|i| c.regs.r[i] == 0x4400 + i as u32),
+            "callee registers restored"
+        );
+    }
+
+    /// Non-secure thread, Secure IRQ: the Secure table, a frame on the
+    /// Non-secure MSP, EXC_RETURN 0xFFFF_FFB9 (S=0, ES=1), back to
+    /// Non-secure state.
+    #[test]
+    fn secure_irq_from_ns_state_frames_on_the_ns_stack() {
+        let mut emu = emu_two_worlds(false);
+        emu.core_mut(0).transition_to_nonsecure();
+        let (lr, secure, sp) = take_irq3_then_return(&mut emu, 0x2000_0100);
+        assert_eq!((lr, secure, sp), (0xFFFF_FFB9, true, 0x2000_1000));
+        let c = emu.core(0);
+        assert!(!c.secure);
+        assert_eq!((c.regs.pc(), c.regs.r[13]), (0x2000_0000, 0x2000_2000));
+        assert_eq!(
+            emu.peek(0x2000_2000 - 8),
+            0x2000_0000,
+            "return address on the NS stack"
+        );
+    }
+
+    /// PRIMASK is banked, and either state's mask holds interrupts off:
+    /// Secure code that masked before branching to Non-secure code keeps
+    /// them masked there.
+    #[test]
+    fn either_states_primask_masks_interrupts() {
+        let mut emu = emu_two_worlds(true);
+        emu.core_mut(0).regs.primask = 1;
+        emu.core_mut(0).transition_to_nonsecure();
+        let c = emu.core(0);
+        assert_eq!((c.regs.primask, c.regs.primask_ns), (0, 1));
+        assert!(!c.can_preempt(16 + 3));
+    }
+
     /// Firmware pending an interrupt through STIR (as CMSIS
     /// `NVIC::request` does) gets its handler taken.
     #[test]

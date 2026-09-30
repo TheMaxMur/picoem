@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::{CoreBus, CortexM33, Fault};
 use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY, FPCCR_SPLIMVIOL};
@@ -21,6 +21,22 @@ const UFSR_STKOF: u32 = 1 << 20;
 /// LSPACT=0), or EXC_RETURN[4]=1 claims no FP frame but FPCCR.LSPACT=1 is
 /// still set from a lazy reserve at entry.
 const UFSR_INVPC: u32 = 1 << 17;
+
+/// EXC_RETURN fields (ARMv8-M §B3.19): ES, the handler's security state;
+/// SPSEL and Mode of the interrupted context; FType (1: no FP frame);
+/// DCRS (0: callee registers stacked); S, the stack the frame is on.
+const EXC_RETURN_PREFIX: u32 = 0xFFFF_FF80;
+const EXC_RETURN_ES: u32 = 1 << 0;
+const EXC_RETURN_SPSEL: u32 = 1 << 2;
+const EXC_RETURN_MODE: u32 = 1 << 3;
+const EXC_RETURN_FTYPE: u32 = 1 << 4;
+const EXC_RETURN_DCRS: u32 = 1 << 5;
+const EXC_RETURN_S: u32 = 1 << 6;
+/// Additional state context (Secure to Non-secure entry): integrity
+/// signature, a reserved word, R4-R11.
+const ADDITIONAL_CONTEXT: u32 = 0x28;
+/// Integrity signature for a frame without FP state (FType = 1).
+const INTEGRITY_SIGNATURE: u32 = 0xFEFA_125B;
 
 impl CortexM33 {
     // --- EXC_RETURN detection ---
@@ -105,7 +121,18 @@ impl CortexM33 {
         let basic_frame: u32 = 32;
         // Extra FP region: 18 words = S0-S15 + FPSCR + 1 reserved.
         let fp_extra: u32 = if had_fp { 72 } else { 0 };
-        let frame_sp = aligned_sp.wrapping_sub(basic_frame + fp_extra);
+        // Secure code interrupted for a Non-secure handler also stacks the
+        // additional state context below the basic frame.
+        let target_secure = self.exception_targets_secure(exc_num);
+        let from_secure = self.secure;
+        let callee_stacked = from_secure && !target_secure;
+        let extra = if callee_stacked {
+            ADDITIONAL_CONTEXT
+        } else {
+            0
+        };
+        let context_sp = aligned_sp.wrapping_sub(basic_frame + fp_extra);
+        let frame_sp = context_sp.wrapping_sub(extra);
         let was_padded = aligned_sp != original_sp;
 
         // Stack-limit check (Armv8-M MSPLIM/PSPLIM, §B3.4.1). Compares
@@ -142,20 +169,35 @@ impl CortexM33 {
         }
 
         // Push exception frame: R0, R1, R2, R3, R12, LR, ReturnAddress, xPSR
-        self.bus_write32(frame_sp, self.regs.r[0], bus);
-        self.bus_write32(frame_sp.wrapping_add(4), self.regs.r[1], bus);
-        self.bus_write32(frame_sp.wrapping_add(8), self.regs.r[2], bus);
-        self.bus_write32(frame_sp.wrapping_add(12), self.regs.r[3], bus);
-        self.bus_write32(frame_sp.wrapping_add(16), self.regs.r[12], bus);
-        self.bus_write32(frame_sp.wrapping_add(20), self.regs.lr(), bus);
-        self.bus_write32(frame_sp.wrapping_add(24), self.return_address(exc_num), bus);
-        self.bus_write32(frame_sp.wrapping_add(28), stacked_xpsr, bus);
+        self.bus_write32(context_sp, self.regs.r[0], bus);
+        self.bus_write32(context_sp.wrapping_add(4), self.regs.r[1], bus);
+        self.bus_write32(context_sp.wrapping_add(8), self.regs.r[2], bus);
+        self.bus_write32(context_sp.wrapping_add(12), self.regs.r[3], bus);
+        self.bus_write32(context_sp.wrapping_add(16), self.regs.r[12], bus);
+        self.bus_write32(context_sp.wrapping_add(20), self.regs.lr(), bus);
+        self.bus_write32(
+            context_sp.wrapping_add(24),
+            self.return_address(exc_num),
+            bus,
+        );
+        self.bus_write32(context_sp.wrapping_add(28), stacked_xpsr, bus);
+        if callee_stacked {
+            self.bus_write32(frame_sp, INTEGRITY_SIGNATURE, bus);
+            self.bus_write32(frame_sp.wrapping_add(4), 0, bus);
+            for i in 0..8 {
+                self.bus_write32(
+                    frame_sp.wrapping_add(8 + 4 * i),
+                    self.regs.r[4 + i as usize],
+                    bus,
+                );
+            }
+        }
 
         // FP context — eager (LSPEN=0) writes S0-S15 + FPSCR now; lazy
         // (LSPEN=1, default) reserves the slots and sets FPCCR.LSPACT
         // so the first FP op in handler mode performs the flush.
         if had_fp {
-            let fp_region_sp = frame_sp.wrapping_add(basic_frame);
+            let fp_region_sp = context_sp.wrapping_add(basic_frame);
             let lspen = self.ppb.fpccr & FPCCR_LSPEN != 0;
             // Always record FPCAR — needed by lazy path and by the
             // exit-pop path when LSPACT is cleared.
@@ -194,27 +236,44 @@ impl CortexM33 {
             self.regs.msp = frame_sp;
         }
 
-        // FIXME(trustzone): these values don't encode the S bit — NS exceptions will claim Secure return
-        // Set LR to EXC_RETURN (Armv8-M, non-secure). Bit [4] = FType: 0
-        // means an FP frame is present (so 0xFFFF_FFE_) and 1 means no FP
-        // frame (so 0xFFFF_FFF_, matching Phase 3 behavior). The S=1 stub
-        // is preserved per HLD §2 non-goals.
-        let base = if had_fp {
-            0xFFFF_FFE0_u32
-        } else {
-            0xFFFF_FFF0_u32
-        };
-        self.regs.r[14] = base
-            | if self.regs.in_handler_mode() {
-                0x1 // return to Handler, MSP
-            } else if use_psp {
-                0xD // return to Thread, PSP
-            } else {
-                0x9 // return to Thread, MSP
-            };
+        // EXC_RETURN: the interrupted context's state, mode and stack, and
+        // the handler's security state.
+        let mut exc_return = EXC_RETURN_PREFIX;
+        for (bit, set) in [
+            (EXC_RETURN_S, from_secure),
+            (EXC_RETURN_DCRS, !callee_stacked),
+            (EXC_RETURN_FTYPE, !had_fp),
+            (EXC_RETURN_MODE, !self.regs.in_handler_mode()),
+            (EXC_RETURN_SPSEL, use_psp),
+            (EXC_RETURN_ES, target_secure),
+        ] {
+            if set {
+                exc_return |= bit;
+            }
+        }
+        self.regs.r[14] = exc_return;
+        if callee_stacked {
+            // Nothing of the Secure context reaches the Non-secure handler.
+            self.regs.r[..13].fill(0);
+            self.regs.xpsr &= !0xF80F_0000;
+        }
 
-        // Fetch vector from table
-        let vtor = self.ppb.vtor;
+        // The handler runs in its own security state, on that state's MSP.
+        self.regs.sync_sp_from_banked();
+        if target_secure != from_secure {
+            if target_secure {
+                self.transition_to_secure();
+            } else {
+                self.transition_to_nonsecure();
+            }
+        }
+
+        // Fetch vector from the handler's state's table
+        let vtor = if target_secure {
+            self.ppb.vtor
+        } else {
+            self.ppb.ns.vtor
+        };
         let vector = self.bus_read32(vtor.wrapping_add((exc_num as u32) * 4), bus);
         self.regs.set_pc(vector & !1);
 
@@ -236,6 +295,26 @@ impl CortexM33 {
         );
 
         12
+    }
+
+    /// Which security state takes exception `exc_num` (ARMv8-M
+    /// `ExceptionTargetsSecure`): external interrupts by NVIC_ITNS; NMI,
+    /// HardFault and BusFault Secure unless AIRCR.BFHFNMINS; the banked
+    /// MemManage, UsageFault and SVCall in the state that raised them; the
+    /// rest Secure (only the Secure PendSV/SysTick pend bits are modelled).
+    pub(crate) fn exception_targets_secure(&self, exc_num: u16) -> bool {
+        match exc_num {
+            2 | 3 | 5 => self.ppb.aircr & (1 << 13) == 0,
+            4 | 6 | 11 => self.secure,
+            16.. => {
+                let irq = (exc_num - 16) as usize;
+                self.ppb
+                    .nvic_itns
+                    .get(irq / 32)
+                    .is_none_or(|w| w & (1 << (irq % 32)) == 0)
+            }
+            _ => true,
+        }
     }
 
     // --- Exception return ---
@@ -297,11 +376,37 @@ impl CortexM33 {
         // Handler-mode instructions may have modified r[13] (MSP) without
         // syncing to the banked field. Flush now for correct unstack addr.
         self.regs.sync_sp_to_banked();
-        let sp = if return_to_psp {
+        // Return to the state the frame belongs to (EXC_RETURN.S): its
+        // bank's stack pointers become the active ones.
+        let return_secure = exc_return & EXC_RETURN_S != 0;
+        let crossing = return_secure != self.secure;
+        if crossing {
+            if return_secure {
+                self.transition_to_secure();
+            } else {
+                self.transition_to_nonsecure();
+            }
+        }
+        let mut sp = if return_to_psp {
             self.regs.psp
         } else {
             self.regs.msp
         };
+        // Callee registers stacked on entry (DCRS=0): restore them from the
+        // additional state context below the basic frame.
+        let callee_stacked = exc_return & EXC_RETURN_DCRS == 0;
+        if callee_stacked {
+            if self.bus_read32(sp, bus) != INTEGRITY_SIGNATURE {
+                warn!(
+                    sp = format_args!("{sp:#010x}"),
+                    "exception return: bad integrity signature"
+                );
+            }
+            for i in 0..8 {
+                self.regs.r[4 + i] = self.bus_read32(sp.wrapping_add(8 + 4 * i as u32), bus);
+            }
+            sp = sp.wrapping_add(ADDITIONAL_CONTEXT);
+        }
 
         // Tail-chain speculation (ARMv8-M §B3.4.2).
         //
@@ -321,7 +426,13 @@ impl CortexM33 {
         let saved_ipsr_bits = self.regs.xpsr & 0x1FF;
         self.regs.xpsr = (self.regs.xpsr & !0x1FF) | (post_pop_ipsr as u32);
         self.ppb.clear_active(active_exc as u16);
-        if let Some(new_exc) = self.pick_tail_chain_target() {
+        // Tail-chain only within one security state; across states the
+        // pending exception is taken after the return, with its own entry.
+        if let Some(new_exc) = self.pick_tail_chain_target()
+            && !crossing
+            && !callee_stacked
+            && self.exception_targets_secure(new_exc) == self.secure
+        {
             return self.activate_tail_chain(new_exc, exc_return, bus);
         }
         // No tail-chain: restore IPSR so the unstack below overwrites
@@ -497,7 +608,11 @@ impl CortexM33 {
 
         // Fetch vector, update PC. Already in handler mode on MSP,
         // so no CONTROL/SP changes.
-        let vtor = self.ppb.vtor;
+        let vtor = if self.secure {
+            self.ppb.vtor
+        } else {
+            self.ppb.ns.vtor
+        };
         let vector = self.bus_read32(vtor.wrapping_add((new_exc as u32) * 4), bus);
         self.regs.set_pc(vector & !1);
         self.regs.sync_sp_from_banked();
@@ -528,10 +643,20 @@ impl CortexM33 {
     /// The lowest (most restrictive in architectural terms, numerically
     /// smallest) of these wins.
     pub(crate) fn execution_priority(&self) -> i16 {
+        // Both security states' masks boost the execution priority; the
+        // active set is `regs.x`, the other state's `regs.x_ns`. With
+        // AIRCR.PRIS and BFHFNMINS clear (the only values modelled),
+        // FAULTMASK_NS boosts to 0 like a PRIMASK.
+        let r = &self.regs;
+        let (s_faultmask, ns_faultmask) = if self.secure {
+            (r.faultmask, r.faultmask_ns)
+        } else {
+            (r.faultmask_ns, r.faultmask)
+        };
         let mut prio: i16 = 256;
-        if self.regs.faultmask & 1 != 0 {
+        if s_faultmask & 1 != 0 {
             prio = -1;
-        } else if self.regs.primask & 1 != 0 {
+        } else if (r.primask | r.primask_ns | ns_faultmask) & 1 != 0 {
             prio = 0;
         }
 
@@ -540,11 +665,13 @@ impl CortexM33 {
         // preserves the ordering PendingPrio < ExecPrio ⇒ preempt.
         // BASEPRI is byte-wide; pre-mask to 0xE0 so callers who write
         // an unmasked byte observe the architectural fold.
-        let basepri = (self.regs.basepri & 0xFF) as u8;
-        if basepri != 0 {
-            let bp = (basepri & 0xE0) as i16;
-            if bp < prio {
-                prio = bp;
+        for basepri in [r.basepri, r.basepri_ns] {
+            let basepri = (basepri & 0xFF) as u8;
+            if basepri != 0 {
+                let bp = (basepri & 0xE0) as i16;
+                if bp < prio {
+                    prio = bp;
+                }
             }
         }
 
