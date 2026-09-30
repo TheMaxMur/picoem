@@ -2497,6 +2497,29 @@ mod stage5_lib_residue {
         );
     }
 
+    /// Code running in Non-secure state that stores to VTOR at
+    /// 0xE000ED08 sets the Non-secure VTOR and reads it back; the Secure
+    /// VTOR is untouched.
+    #[test]
+    fn ns_state_scs_access_hits_the_ns_bank() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.memory.sram_write16(0, 0x6001); // str r1, [r0]
+        emu.bus.memory.sram_write16(2, 0x6802); // ldr r2, [r0]
+        emu.bus.memory.sram_write16(4, 0xE7FE); // b .
+        emu.core_mut(1).halt();
+        let c = emu.core_mut(0);
+        c.ppb.vtor = 0x1000_0000;
+        c.regs.r[0] = 0xE000_ED08;
+        c.regs.r[1] = 0x2000_4000;
+        c.regs.set_pc(0x2000_0000);
+        c.transition_to_nonsecure();
+        emu.step().unwrap();
+        let c = emu.core(0);
+        assert_eq!(c.ppb.ns.vtor, 0x2000_4000);
+        assert_eq!(c.ppb.vtor, 0x1000_0000);
+        assert_eq!(c.regs.r[2], 0x2000_4000);
+    }
+
     /// Firmware pending an interrupt through STIR (as CMSIS
     /// `NVIC::request` does) gets its handler taken.
     #[test]

@@ -12,8 +12,15 @@ impl CortexM33 {
         let coproc = ((hw1 >> 8) & 0xF) as u8;
 
         // Check CPACR (2 bits per coprocessor). Phase 0b.1 Commit B:
-        // per-core PPB (including CPACR) now lives on `self.ppb`.
-        let cpacr = self.ppb.cpacr;
+        // per-core PPB (including CPACR) now lives on `self.ppb`. Non-secure
+        // state uses its own CPACR, and only for what NSACR grants it.
+        let cpacr = if self.secure {
+            self.ppb.cpacr
+        } else if self.ppb.nsacr & (1 << coproc) != 0 {
+            self.ppb.ns.cpacr
+        } else {
+            0
+        };
         let access = (cpacr >> (coproc as u32 * 2)) & 0x3;
         if access == 0 {
             self.pending_fault = Some(Fault::UsageFault);
@@ -856,6 +863,33 @@ mod tests {
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
 
         assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
+    }
+
+    /// Non-secure state uses its own CPACR, and only for the coprocessors
+    /// NSACR grants it; the Secure CPACR does not reach it.
+    #[test]
+    fn ns_state_needs_nsacr_and_its_own_cpacr() {
+        let mut cpu = CortexM33::for_test(0);
+        let mut bus = Bus::default();
+        enable_cp(&mut cpu, 4);
+        cpu.transition_to_nonsecure();
+        let (hw0, hw1) = encode_mcr_full(4, 0, 0, 2, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(
+            matches!(cpu.pending_fault.take(), Some(Fault::UsageFault)),
+            "Secure CPACR only"
+        );
+        cpu.ppb.ns.cpacr = 0x3 << 8;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(
+            matches!(cpu.pending_fault.take(), Some(Fault::UsageFault)),
+            "NSACR withholds CP4"
+        );
+        cpu.ppb.nsacr = 1 << 4;
+        cpu.regs.r[2] = 0x1234;
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(cpu.dcp_halves[0], 0x1234);
     }
 
     #[test]

@@ -832,10 +832,29 @@ impl CortexM33 {
         addr >> 28 == 0xD && PerCoreSio::owns_offset(addr & 0xFFF)
     }
 
+    /// A read of the SCS as this core's security state sees it: from
+    /// Non-secure state the Security Extension's Non-secure bank.
+    fn ppb_read32(&mut self, addr: u32) -> u32 {
+        if self.secure {
+            self.ppb.read32(addr)
+        } else {
+            self.ppb.read32_ns(addr)
+        }
+    }
+
+    /// A write to the SCS as this core's security state sees it.
+    fn ppb_write32(&mut self, addr: u32, val: u32) {
+        if self.secure {
+            self.ppb.write32(addr, val);
+        } else {
+            self.ppb.write32_ns(addr, val);
+        }
+    }
+
     pub(crate) fn bus_read32<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u32 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            let val = self.ppb.read32(addr);
+            let val = self.ppb_read32(addr);
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
             }
@@ -858,7 +877,7 @@ impl CortexM33 {
         // core's quantum slice and clears the peer's `exclusive_address`.
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            self.ppb.write32(addr, val);
+            self.ppb_write32(addr, val);
             self.sync_nvic_to_irq_pending(addr, bus);
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('W', 4, addr, val, self.core_id);
@@ -882,7 +901,7 @@ impl CortexM33 {
             // firmware sees plausible data. Contrast bus_read8, which
             // returns 0 — byte access is more unusual and worth flagging
             // via a telltale zero.
-            let word = self.ppb.read32(addr & !3);
+            let word = self.ppb_read32(addr & !3);
             let val = if addr & 2 != 0 {
                 (word >> 16) as u16
             } else {
@@ -919,13 +938,13 @@ impl CortexM33 {
             // defensively RMW the matching half of the containing 32-bit
             // register rather than faulting. Contrast bus_write8, which
             // drops the write — byte writes to PPB are more unusual.
-            let old = self.ppb.read32(addr & !3);
+            let old = self.ppb_read32(addr & !3);
             let new_val = if addr & 2 != 0 {
                 (old & 0x0000_FFFF) | ((val as u32) << 16)
             } else {
                 (old & 0xFFFF_0000) | val as u32
             };
-            self.ppb.write32(addr & !3, new_val);
+            self.ppb_write32(addr & !3, new_val);
             self.sync_nvic_to_irq_pending(addr & !3, bus);
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('W', 2, addr, val as u32, self.core_id);
@@ -949,7 +968,7 @@ impl CortexM33 {
             // PPB registers are word-access-only; byte reads return 0 —
             // except the byte-accessible priority registers.
             let val = if Self::is_byte_accessible_ppb(addr) {
-                (self.ppb.read32(addr & !3) >> ((addr & 3) * 8)) as u8
+                (self.ppb_read32(addr & !3) >> ((addr & 3) * 8)) as u8
             } else {
                 0
             };
@@ -989,8 +1008,8 @@ impl CortexM33 {
             // the byte in their lane.
             if Self::is_byte_accessible_ppb(addr) {
                 let shift = (addr & 3) * 8;
-                let old = self.ppb.read32(addr & !3);
-                self.ppb.write32(
+                let old = self.ppb_read32(addr & !3);
+                self.ppb_write32(
                     addr & !3,
                     (old & !(0xFF << shift)) | ((val as u32) << shift),
                 );

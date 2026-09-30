@@ -50,6 +50,97 @@ pub(crate) const NVIC_BIT_WORDS: usize = 2;
 /// are unused (IRQs 52..55 do not exist).
 pub(crate) const NVIC_IPR_WORDS: usize = 13;
 
+/// AIRCR fields only Secure state sees: PRIS, BFHFNMINS, SYSRESETREQS.
+const AIRCR_SECURE_ONLY: u32 = (1 << 14) | (1 << 13) | (1 << 3);
+
+/// The Non-secure bank of the SCS registers the Security Extension banks
+/// (ARMv8-M §D1.2): what Non-secure state sees at 0xE000_E000. Banked
+/// registers not listed here (ICSR's PendSV/SysTick bits, the NS SysTick
+/// counting, FP context) are not modelled per state.
+#[derive(Clone)]
+pub struct NsBank {
+    pub vtor: u32,
+    pub scr: u32,
+    pub ccr: u32,
+    pub shpr: [u8; 12],
+    pub shcsr: u32,
+    /// MMFSR and UFSR (the BFSR byte is Secure unless AIRCR.BFHFNMINS).
+    pub cfsr: u32,
+    pub mmfar: u32,
+    pub cpacr: u32,
+    pub mpu_ctrl: u32,
+    pub mpu_rnr: u32,
+    pub mpu_regions: [(u32, u32); 16],
+    /// The Non-secure SysTick's registers: stored, not counted.
+    pub syst_csr: u32,
+    pub syst_rvr: u32,
+    pub syst_cvr: u32,
+}
+
+impl Default for NsBank {
+    fn default() -> Self {
+        Self {
+            vtor: 0,
+            scr: 0,
+            ccr: 0x0000_0200, // STKALIGN=1
+            shpr: [0; 12],
+            shcsr: 0,
+            cfsr: 0,
+            mmfar: 0,
+            cpacr: 0,
+            mpu_ctrl: 0,
+            mpu_rnr: 0,
+            mpu_regions: [(0, 0); 16],
+            syst_csr: 0,
+            syst_rvr: 0,
+            syst_cvr: 0,
+        }
+    }
+}
+
+/// MPU_TYPE: 16 regions on RP2350 Cortex-M33 (both banks).
+const MPU_TYPE: u32 = 0x0000_1000;
+
+/// An MPU register read, for either bank: `None` if `off` is not one.
+fn mpu_read(ctrl: u32, rnr: u32, regions: &[(u32, u32); 16], off: u32) -> Option<u32> {
+    let alias = |first: u32| ((rnr as usize & !0x3) | ((off - first) / 8 + 1) as usize) & 0xF;
+    Some(match off {
+        0xED90 => MPU_TYPE,
+        0xED94 => ctrl,
+        0xED98 => rnr,
+        0xED9C => regions[(rnr & 0xF) as usize].0,
+        0xEDA0 => regions[(rnr & 0xF) as usize].1,
+        // RBAR_An / RLAR_An (ARMv8-M §B11.2.5-8) access region
+        // `(RNR & !3) | n` for n in 1..=3.
+        0xEDA4 | 0xEDAC | 0xEDB4 => regions[alias(0xEDA4)].0,
+        0xEDA8 | 0xEDB0 | 0xEDB8 => regions[alias(0xEDA8)].1,
+        _ => return None,
+    })
+}
+
+/// An MPU register write, for either bank: false if `off` is not one.
+/// RLAR bit 4 is RES0 (the bootrom's readback self-test depends on it).
+fn mpu_write(
+    ctrl: &mut u32,
+    rnr: &mut u32,
+    regions: &mut [(u32, u32); 16],
+    off: u32,
+    val: u32,
+) -> bool {
+    let alias = |first: u32| ((*rnr as usize & !0x3) | ((off - first) / 8 + 1) as usize) & 0xF;
+    match off {
+        0xED90 => {}
+        0xED94 => *ctrl = val,
+        0xED98 => *rnr = val & 0xF,
+        0xED9C => regions[(*rnr & 0xF) as usize].0 = val,
+        0xEDA0 => regions[(*rnr & 0xF) as usize].1 = val & !0x10,
+        0xEDA4 | 0xEDAC | 0xEDB4 => regions[alias(0xEDA4)].0 = val,
+        0xEDA8 | 0xEDB0 | 0xEDB8 => regions[alias(0xEDA8)].1 = val & !0x10,
+        _ => return false,
+    }
+    true
+}
+
 /// Per-core Private Peripheral Bus state (NVIC, SCB, SysTick stubs).
 /// Phase 3: slim — only what the bootrom needs.
 pub struct Ppb {
@@ -168,6 +259,12 @@ pub struct Ppb {
     /// NVIC_IPR0..12 — priority bytes, packed 4 per word. Each byte is
     /// masked to [`NVIC_PRIORITY_MASK`] (bits [7:5], 8 levels).
     pub nvic_ipr: [u32; NVIC_IPR_WORDS],
+    /// NVIC_ITNS0..1 — the interrupt targets Non-secure state (Secure-only).
+    pub nvic_itns: [u32; NVIC_BIT_WORDS],
+    /// NSACR (0xE000ED8C) — coprocessors Non-secure state may use.
+    pub nsacr: u32,
+    /// The Non-secure bank of the banked SCS registers.
+    pub ns: NsBank,
 }
 
 impl Default for Ppb {
@@ -207,6 +304,9 @@ impl Default for Ppb {
             nvic_ispr: [AtomicU32::new(0), AtomicU32::new(0)],
             nvic_iabr: [AtomicU32::new(0), AtomicU32::new(0)],
             nvic_ipr: [0; NVIC_IPR_WORDS],
+            nvic_itns: [0; NVIC_BIT_WORDS],
+            nsacr: 0,
+            ns: NsBank::default(),
         }
     }
 }
@@ -269,6 +369,8 @@ impl Ppb {
             0xE204 | 0xE284 => self.nvic_ispr[1].load(Ordering::Relaxed),
             0xE300 => self.nvic_iabr[0].load(Ordering::Relaxed),
             0xE304 => self.nvic_iabr[1].load(Ordering::Relaxed),
+            0xE380 => self.nvic_itns[0],
+            0xE384 => self.nvic_itns[1],
             0xE400..=0xE430 if (addr & 0x3) == 0 => {
                 let idx = (((addr & 0xFFFF) - 0xE400) / 4) as usize;
                 if idx < NVIC_IPR_WORDS {
@@ -334,36 +436,12 @@ impl Ppb {
             0xEF38 => self.fpcar,
             0xEF3C => self.fpdscr,
 
-            // MPU_TYPE: 16 regions on RP2350 Cortex-M33
-            0xED90 => 0x0000_1000, // DREGION=16, IREGION=0, SEPARATE=0
-            // MPU_CTRL
-            0xED94 => self.mpu_ctrl,
-            // MPU_RNR
-            0xED98 => self.mpu_rnr,
-            // MPU_RBAR
-            0xED9C => {
-                let idx = (self.mpu_rnr & 0xF) as usize;
-                self.mpu_regions[idx].0
+            // MPU (0xED90..=0xEDB8)
+            off @ 0xED90..=0xEDB8 => {
+                mpu_read(self.mpu_ctrl, self.mpu_rnr, &self.mpu_regions, off).unwrap_or(0)
             }
-            // MPU_RLAR
-            0xEDA0 => {
-                let idx = (self.mpu_rnr & 0xF) as usize;
-                self.mpu_regions[idx].1
-            }
-            // MPU_RBAR_A1 / RLAR_A1 / ... A3 (ARMv8-M §B11.2.5-8):
-            // alias registers access region `(RNR & !3) | n` for n ∈ {1,2,3}.
-            // Surfaced by the bootrom's MPU readback self-test which writes
-            // all four (base, alias1, alias2, alias3) pairs in a single stmia.
-            0xEDA4 | 0xEDAC | 0xEDB4 => {
-                let n = ((addr as usize) - 0xEDA4) / 8 + 1;
-                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
-                self.mpu_regions[idx & 0xF].0
-            }
-            0xEDA8 | 0xEDB0 | 0xEDB8 => {
-                let n = ((addr as usize) - 0xEDA8) / 8 + 1;
-                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
-                self.mpu_regions[idx & 0xF].1
-            }
+            // NSACR
+            0xED8C => self.nsacr,
 
             // SAU_CTRL
             0xEDD0 => self.sau_ctrl,
@@ -446,6 +524,8 @@ impl Ppb {
             }
             // IABR is read-only; writes are ignored.
             0xE300 | 0xE304 => {}
+            0xE380 => self.nvic_itns[0] = val,
+            0xE384 => self.nvic_itns[1] = val & nvic_word1_valid_mask(),
             // NVIC_IPR0..12 — 4×u8 lanes, each masked to bits [7:5].
             // Misaligned or out-of-range IPR writes fall through to the
             // reserved-region silent-ignore arm below.
@@ -557,36 +637,18 @@ impl Ppb {
             0xEF38 => self.fpcar = val & !0x7,
             0xEF3C => self.fpdscr = val,
 
-            // MPU_TYPE: read-only
-            0xED90 => {}
-            // MPU_CTRL
-            0xED94 => self.mpu_ctrl = val,
-            // MPU_RNR
-            0xED98 => self.mpu_rnr = val & 0xF,
-            // MPU_RBAR (ARMv8-M §B11.2.5): [31:5] BASE, [4:3] SH,
-            // [2:1] AP, [0] XN — all bits carry meaning.
-            0xED9C => {
-                let idx = (self.mpu_rnr & 0xF) as usize;
-                self.mpu_regions[idx].0 = val;
+            // MPU (0xED90..=0xEDB8)
+            off @ 0xED90..=0xEDB8 => {
+                mpu_write(
+                    &mut self.mpu_ctrl,
+                    &mut self.mpu_rnr,
+                    &mut self.mpu_regions,
+                    off,
+                    val,
+                );
             }
-            // MPU_RLAR (ARMv8-M §B11.2.8): [31:5] LIMIT, [4] RES0,
-            // [3:1] AttrIndx, [0] EN. Mask bit [4] so it reads back as 0
-            // (the bootrom's readback self-test depends on this).
-            0xEDA0 => {
-                let idx = (self.mpu_rnr & 0xF) as usize;
-                self.mpu_regions[idx].1 = val & !0x10;
-            }
-            // MPU_RBAR_An / RLAR_An aliases — see read path for definition.
-            0xEDA4 | 0xEDAC | 0xEDB4 => {
-                let n = ((addr as usize) - 0xEDA4) / 8 + 1;
-                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
-                self.mpu_regions[idx & 0xF].0 = val;
-            }
-            0xEDA8 | 0xEDB0 | 0xEDB8 => {
-                let n = ((addr as usize) - 0xEDA8) / 8 + 1;
-                let idx = ((self.mpu_rnr as usize) & !0x3) | n;
-                self.mpu_regions[idx & 0xF].1 = val & !0x10;
-            }
+            // NSACR
+            0xED8C => self.nsacr = val,
 
             // SAU_CTRL
             0xEDD0 => self.sau_ctrl = val,
@@ -612,6 +674,143 @@ impl Ppb {
             // Unknown PPB register — ignore
             _ => {}
         }
+    }
+
+    /// The SCS as Non-secure state sees it: the Non-secure bank for the
+    /// banked registers, zero for the Secure-only ones (SAU, SFSR/SFAR,
+    /// ITNS, HFSR/BFAR, AIRCR's Secure fields), NVIC state only for the
+    /// interrupts that target Non-secure state; everything else shared.
+    pub fn read32_ns(&mut self, addr: u32) -> u32 {
+        let off = addr & 0xFFFF;
+        let ns_word = |w: usize| self.nvic_itns[w];
+        match off {
+            0xE010 => {
+                let out = self.ns.syst_csr;
+                self.ns.syst_csr &= !SYST_CSR_COUNTFLAG;
+                out
+            }
+            0xE014 => self.ns.syst_rvr & SYST_24BIT_MASK,
+            0xE018 => self.ns.syst_cvr & SYST_24BIT_MASK,
+            0xE100 | 0xE180 => self.nvic_iser[0].load(Ordering::Relaxed) & ns_word(0),
+            0xE104 | 0xE184 => self.nvic_iser[1].load(Ordering::Relaxed) & ns_word(1),
+            0xE200 | 0xE280 => self.nvic_ispr[0].load(Ordering::Relaxed) & ns_word(0),
+            0xE204 | 0xE284 => self.nvic_ispr[1].load(Ordering::Relaxed) & ns_word(1),
+            0xE300 => self.nvic_iabr[0].load(Ordering::Relaxed) & ns_word(0),
+            0xE304 => self.nvic_iabr[1].load(Ordering::Relaxed) & ns_word(1),
+            0xE380 | 0xE384 => 0,
+            0xE400..=0xE430 if off & 3 == 0 => {
+                let idx = ((off - 0xE400) / 4) as usize;
+                self.nvic_ipr.get(idx).copied().unwrap_or(0) & self.ns_ipr_lanes(idx)
+            }
+            0xED08 => self.ns.vtor,
+            0xED0C => self.aircr & !AIRCR_SECURE_ONLY,
+            0xED10 => self.ns.scr,
+            0xED14 => self.ns.ccr,
+            0xED18 | 0xED1C | 0xED20 => {
+                let start = ((off - 0xED18) / 4 * 4) as usize;
+                u32::from_le_bytes(self.ns.shpr[start..start + 4].try_into().unwrap())
+            }
+            0xED24 => self.ns.shcsr,
+            0xED28 => self.ns.cfsr,
+            0xED2C | 0xED38 => 0,
+            0xED34 => self.ns.mmfar,
+            0xED88 => self.ns.cpacr,
+            0xED8C => self.nsacr,
+            0xED90..=0xEDB8 => {
+                mpu_read(self.ns.mpu_ctrl, self.ns.mpu_rnr, &self.ns.mpu_regions, off).unwrap_or(0)
+            }
+            0xEDD0..=0xEDE8 => 0,
+            _ => self.read32(addr),
+        }
+    }
+
+    /// A write from Non-secure state; see [`Self::read32_ns`].
+    pub fn write32_ns(&mut self, addr: u32, val: u32) {
+        let off = addr & 0xFFFF;
+        match off {
+            0xE010 => {
+                let preserved = self.ns.syst_csr & SYST_CSR_COUNTFLAG;
+                self.ns.syst_csr = (val & !SYST_CSR_COUNTFLAG) | preserved;
+            }
+            0xE014 => self.ns.syst_rvr = val & SYST_24BIT_MASK,
+            0xE018 => {
+                self.ns.syst_cvr = 0;
+                self.ns.syst_csr &= !SYST_CSR_COUNTFLAG;
+            }
+            0xE100 | 0xE104 | 0xE180 | 0xE184 | 0xE200 | 0xE204 | 0xE280 | 0xE284 => {
+                let w = ((off >> 2) & 1) as usize;
+                self.write32(addr, val & self.nvic_itns[w]);
+            }
+            0xE380 | 0xE384 => {}
+            0xE400..=0xE430 if off & 3 == 0 => {
+                let idx = ((off - 0xE400) / 4) as usize;
+                if idx < NVIC_IPR_WORDS {
+                    let lanes = self.ns_ipr_lanes(idx);
+                    let lane_mask = u32::from_le_bytes([NVIC_PRIORITY_MASK; 4]);
+                    self.nvic_ipr[idx] = (self.nvic_ipr[idx] & !lanes) | (val & lanes & lane_mask);
+                }
+            }
+            0xEF00 => {
+                let irq = val & 0x1FF;
+                if irq < crate::irq::IRQ_COUNT
+                    && self.nvic_itns[(irq / 32) as usize] & (1 << (irq % 32)) != 0
+                {
+                    self.write32(addr, val);
+                }
+            }
+            0xED04 => {
+                // NMIPENDSET is Secure unless AIRCR.BFHFNMINS; the Non-secure
+                // PendSV/SysTick pend bits are not modelled.
+                self.write32(
+                    addr,
+                    val & !(ICSR_NMIPENDSET | ICSR_PENDSVSET | ICSR_PENDSTSET),
+                );
+            }
+            0xED08 => self.ns.vtor = val & !0x7F,
+            0xED0C => {
+                let keep = self.aircr & AIRCR_SECURE_ONLY;
+                self.write32(addr, (val & !AIRCR_SECURE_ONLY) | keep);
+            }
+            0xED10 => self.ns.scr = val,
+            0xED14 => self.ns.ccr = val,
+            0xED18 | 0xED1C | 0xED20 => {
+                let start = ((off - 0xED18) / 4 * 4) as usize;
+                for (i, b) in val.to_le_bytes().iter().enumerate() {
+                    self.ns.shpr[start + i] = b & NVIC_PRIORITY_MASK;
+                }
+            }
+            0xED24 => self.ns.shcsr = val,
+            0xED28 => self.ns.cfsr &= !val,
+            0xED2C | 0xED38 => {}
+            0xED34 => self.ns.mmfar = val,
+            0xED88 => self.ns.cpacr = val,
+            0xED8C => {}
+            0xED90..=0xEDB8 => {
+                let ns = &mut self.ns;
+                mpu_write(
+                    &mut ns.mpu_ctrl,
+                    &mut ns.mpu_rnr,
+                    &mut ns.mpu_regions,
+                    off,
+                    val,
+                );
+            }
+            0xEDD0..=0xEDE8 => {}
+            _ => self.write32(addr, val),
+        }
+    }
+
+    /// Byte lanes of NVIC_IPR word `idx` whose interrupt targets
+    /// Non-secure state.
+    fn ns_ipr_lanes(&self, idx: usize) -> u32 {
+        (0..4).fold(0, |m, lane| {
+            let irq = idx * 4 + lane;
+            let ns = self
+                .nvic_itns
+                .get(irq / 32)
+                .is_some_and(|w| w & (1 << (irq % 32)) != 0);
+            if ns { m | (0xFF << (lane * 8)) } else { m }
+        })
     }
 
     /// Get the priority of a system exception (4-15) from SHPR, or an
@@ -870,6 +1069,48 @@ pub(crate) fn nvic_word1_valid_mask() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Non-secure state reaches NVIC state only for the interrupts that
+    /// ITNS gives it, and none of the Secure-only registers.
+    #[test]
+    fn ns_view_masks_nvic_by_itns_and_hides_secure_only_registers() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_E380, 1 << 14); // ITNS: USBCTRL_IRQ to NS
+        ppb.write32_ns(0xE000_E100, (1 << 14) | (1 << 3));
+        assert_eq!(
+            ppb.read32(0xE000_E100),
+            1 << 14,
+            "the Secure IRQ 3 stays disabled"
+        );
+        ppb.write32(0xE000_E100, 1 << 3);
+        assert_eq!(ppb.read32_ns(0xE000_E100), 1 << 14, "NS does not see IRQ 3");
+        ppb.write32(0xE000_EDD0, 1); // SAU_CTRL
+        assert_eq!(ppb.read32_ns(0xE000_EDD0), 0);
+        assert_eq!(ppb.read32_ns(0xE000_E380), 0);
+        ppb.write32_ns(0xE000_E380, !0);
+        assert_eq!(ppb.read32(0xE000_E380), 1 << 14, "ITNS is Secure-only");
+    }
+
+    /// VTOR, the MPU and CPACR are banked: each state writes its own.
+    #[test]
+    fn ns_view_has_its_own_vtor_mpu_and_cpacr() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_ED08, 0x1000_0000);
+        ppb.write32_ns(0xE000_ED08, 0x0000_4A00);
+        ppb.write32_ns(0xE000_ED94, 5);
+        ppb.write32_ns(0xE000_ED98, 2);
+        ppb.write32_ns(0xE000_ED9C, 0x6AA1);
+        ppb.write32_ns(0xE000_EDA0, 0xFFFF_FFF1);
+        ppb.write32_ns(0xE000_ED88, 0xC000);
+        assert_eq!((ppb.vtor, ppb.ns.vtor), (0x1000_0000, 0x4A00));
+        assert_eq!((ppb.mpu_ctrl, ppb.ns.mpu_ctrl), (0, 5));
+        assert_eq!(ppb.ns.mpu_regions[2], (0x6AA1, 0xFFFF_FFE1));
+        assert_eq!(ppb.mpu_regions[2], (0, 0));
+        assert_eq!(ppb.read32_ns(0xE000_ED9C), 0x6AA1);
+        assert_eq!(ppb.cpacr, 0x00F0_0000);
+        assert_eq!(ppb.read32_ns(0xE000_ED88), 0xC000);
+        assert_eq!(ppb.read32(0xE000_ED08), 0x1000_0000);
+    }
 
     #[test]
     fn test_cpuid_read() {
