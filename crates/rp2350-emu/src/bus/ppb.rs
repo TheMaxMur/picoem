@@ -465,6 +465,16 @@ impl Ppb {
             }
             // Reserved / non-existent NVIC registers — writes ignored.
             addr if (0xE100..=0xE4FF).contains(&addr) => {}
+            // STIR — writing INTID[8:0] pends that external interrupt, the
+            // same as setting its NVIC_ISPR bit; IDs past the implemented
+            // lines are ignored. (CCR.USERSETMPEND gates unprivileged
+            // writes; the PPB does not see the privilege level.)
+            0xEF00 => {
+                let irq = val & 0x1FF;
+                if irq < crate::irq::IRQ_COUNT {
+                    self.nvic_ispr[(irq / 32) as usize].fetch_or(1 << (irq % 32), Ordering::Relaxed);
+                }
+            }
 
             // DWT_CTRL — only CYCCNTENA (bit 0) is modelled; other bits
             // are stored for firmware round-trip.
@@ -997,6 +1007,21 @@ mod tests {
     const NVIC_ICPR1: u32 = 0xE000_E284;
     const NVIC_IABR0: u32 = 0xE000_E300;
     const NVIC_IPR0: u32 = 0xE000_E400;
+
+    /// STIR pends by interrupt number — the path CMSIS `NVIC::request`
+    /// (and embassy's interrupt-executor pender) takes on Armv7-M/v8-M.
+    #[test]
+    fn test_stir_pends_by_interrupt_number() {
+        let mut ppb = Ppb::default();
+        ppb.write32(0xE000_EF00, 3);
+        ppb.write32(0xE000_EF00, 48); // a software-only spare line
+        assert_eq!(ppb.read32(NVIC_ISPR0), 1 << 3);
+        assert_eq!(ppb.read32(NVIC_ISPR1), 1 << (48 - 32));
+        // Past the implemented lines: ignored, nothing else latches.
+        ppb.write32(0xE000_EF00, 52);
+        ppb.write32(0xE000_EF00, 0x1FF);
+        assert_eq!(ppb.read32(NVIC_ISPR1), 1 << (48 - 32));
+    }
 
     #[test]
     fn test_nvic_word1_icer_and_icpr_work_on_high_irqs() {

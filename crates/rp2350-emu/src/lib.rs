@@ -2450,6 +2450,29 @@ mod stage5_lib_residue {
         assert_eq!(emu.core(0).regs.ipsr(), 16 + 3, "the IRQ is then taken");
     }
 
+    /// Firmware pending an interrupt through STIR (as CMSIS
+    /// `NVIC::request` does) gets its handler taken.
+    #[test]
+    fn stir_write_from_firmware_takes_the_interrupt() {
+        let mut emu = Emulator::new(Config::default());
+        emu.bus.memory.sram_write16(0, 0x6001); // str r1, [r0]
+        emu.bus.memory.sram_write16(2, 0xE7FE); // b .
+        emu.bus.memory.sram_write16(0x100, 0xE7FE); // handler: b .
+        emu.bus.memory.sram_write32(0x200 + 4 * (16 + 48), 0x2000_0101);
+        emu.core_mut(1).halt();
+        let c = emu.core_mut(0);
+        c.ppb.vtor = 0x2000_0200;
+        c.regs.msp = 0x2000_1000;
+        c.regs.r[13] = 0x2000_1000;
+        c.regs.r[0] = 0xE000_EF00;
+        c.regs.r[1] = 48;
+        c.regs.set_pc(0x2000_0000);
+        emu.mmio_write32(0xE000_E104, 1 << (48 - 32)); // NVIC_ISER1
+        emu.step().unwrap();
+        emu.step().unwrap();
+        assert_eq!(emu.core(0).regs.ipsr(), 16 + 48);
+    }
+
     /// Masked or disabled interrupts are no wake-up event.
     #[test]
     fn wfe_stays_asleep_for_interrupts_that_cannot_preempt() {
