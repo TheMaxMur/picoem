@@ -1932,9 +1932,15 @@ impl CortexM33 {
             },
             // Byte-wise saturating / halving forms: QADD8, QSUB8, SHADD8,
             // SHSUB8, UQADD8, UQSUB8, UHADD8, UHSUB8.
-            0b001 | 0b010 | 0b101 | 0b110 if matches!(par_op1, 0b000 | 0b100) => {
-                self.parallel_8_sat_halving(rd, a, b, par_op1, par_op2 & 0b100 == 0, par_op2 & 0b011 == 0b001)
-            }
+            0b001 | 0b010 | 0b101 | 0b110 if matches!(par_op1, 0b000 | 0b100) => self
+                .parallel_8_sat_halving(
+                    rd,
+                    a,
+                    b,
+                    par_op1,
+                    par_op2 & 0b100 == 0,
+                    par_op2 & 0b011 == 0b001,
+                ),
             // Q-saturating signed (16-bit only)
             0b001 => self.parallel_signed_16(rd, a, b, par_op1, true, false),
             // Halving signed (16-bit only)
@@ -1959,11 +1965,22 @@ impl CortexM33 {
     /// UHADD8/UHSUB8: per byte, the add (`op` = ADD8) or subtract (SUB8)
     /// saturated to the lane (`sat`) or halved from its 9-bit value.
     /// None of these touch the GE flags.
-    fn parallel_8_sat_halving(&mut self, rd: usize, a: u32, b: u32, op: u8, signed: bool, sat: bool) -> u32 {
+    fn parallel_8_sat_halving(
+        &mut self,
+        rd: usize,
+        a: u32,
+        b: u32,
+        op: u8,
+        signed: bool,
+        sat: bool,
+    ) -> u32 {
         let mut result = 0u32;
         for i in 0..4u32 {
             let (x, y) = if signed {
-                ((a >> (i * 8)) as u8 as i8 as i32, (b >> (i * 8)) as u8 as i8 as i32)
+                (
+                    (a >> (i * 8)) as u8 as i8 as i32,
+                    (b >> (i * 8)) as u8 as i8 as i32,
+                )
             } else {
                 ((a >> (i * 8)) as u8 as i32, (b >> (i * 8)) as u8 as i32)
             };

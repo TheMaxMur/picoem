@@ -990,8 +990,10 @@ impl CortexM33 {
             if Self::is_byte_accessible_ppb(addr) {
                 let shift = (addr & 3) * 8;
                 let old = self.ppb.read32(addr & !3);
-                self.ppb
-                    .write32(addr & !3, (old & !(0xFF << shift)) | ((val as u32) << shift));
+                self.ppb.write32(
+                    addr & !3,
+                    (old & !(0xFF << shift)) | ((val as u32) << shift),
+                );
             }
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);

@@ -1125,10 +1125,18 @@ mod load_store_dual_and_exclusive {
     /// monitor is open, then reports 1 and stores nothing once it closed.
     #[test]
     fn acquire_release_exclusive_pairs() {
-        for (ld, st, width) in [(LDAEX, STLEX, 4u32), (LDAEXH, STLEXH, 2), (LDAEXB, STLEXB, 1)] {
+        for (ld, st, width) in [
+            (LDAEX, STLEX, 4u32),
+            (LDAEXH, STLEXH, 2),
+            (LDAEXB, STLEXB, 1),
+        ] {
             let (mut c, mut bus) = core_and_bus();
             let a = 0x2000_0300;
-            let mask = if width == 4 { u32::MAX } else { (1u32 << (width * 8)) - 1 };
+            let mask = if width == 4 {
+                u32::MAX
+            } else {
+                (1u32 << (width * 8)) - 1
+            };
             bus.write32(a, 0xA1B2_C3D4, 0);
             c.set_reg(2, a);
             c.execute_one_wide_with_bus(ld.0, ld.1, &mut bus);
@@ -4798,13 +4806,22 @@ mod dsp_and_fp_transfer_gaps {
         bus.write32(base - 4, 0xDDDD_0004, 0);
         c.set_reg(0, base);
         c.execute_one_wide_with_bus(0xED90, 0x1B02, &mut bus); // vldr d1, [r0, #8]
-        assert_eq!((c.regs.s[2].to_bits(), c.regs.s[3].to_bits()), (0xAAAA_0001, 0xBBBB_0002));
+        assert_eq!(
+            (c.regs.s[2].to_bits(), c.regs.s[3].to_bits()),
+            (0xAAAA_0001, 0xBBBB_0002)
+        );
         c.execute_one_wide_with_bus(0xED10, 0x1B02, &mut bus); // vldr d1, [r0, #-8]
-        assert_eq!((c.regs.s[2].to_bits(), c.regs.s[3].to_bits()), (0xCCCC_0003, 0xDDDD_0004));
+        assert_eq!(
+            (c.regs.s[2].to_bits(), c.regs.s[3].to_bits()),
+            (0xCCCC_0003, 0xDDDD_0004)
+        );
         c.regs.s[4] = f32::from_bits(0x0102_0304);
         c.regs.s[5] = f32::from_bits(0x0506_0708);
         c.execute_one_wide_with_bus(0xED80, 0x2B04, &mut bus); // vstr d2, [r0, #16]
-        assert_eq!((bus.read32(base + 16, 0), bus.read32(base + 20, 0)), (0x0102_0304, 0x0506_0708));
+        assert_eq!(
+            (bus.read32(base + 16, 0), bus.read32(base + 20, 0)),
+            (0x0102_0304, 0x0506_0708)
+        );
         assert_eq!(c.reg(0), base, "no writeback");
     }
 
@@ -4837,7 +4854,10 @@ mod dsp_and_fp_transfer_gaps {
         c.set_reg(0, base);
         c.execute_one_wide_with_bus(0xECB0, 0x1B06, &mut bus); // vldmia r0!, {d1-d3}
         assert_eq!(c.reg(0), base + 24);
-        assert_eq!((c.regs.s[2].to_bits(), c.regs.s[7].to_bits()), (0x9000, 0x9005));
+        assert_eq!(
+            (c.regs.s[2].to_bits(), c.regs.s[7].to_bits()),
+            (0x9000, 0x9005)
+        );
         c.execute_one_wide_with_bus(0xED20, 0x1B06, &mut bus); // vstmdb r0!, {d1-d3}
         assert_eq!(c.reg(0), base);
     }

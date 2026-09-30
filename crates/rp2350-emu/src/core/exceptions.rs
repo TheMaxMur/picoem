@@ -582,11 +582,14 @@ impl CortexM33 {
         }
         let exec = self.execution_priority();
         let preempts = |exc: u16| self.ppb.exception_priority(exc) < exec;
-        if (icsr & ICSR_PENDSVSET != 0 && preempts(14)) || (icsr & ICSR_PENDSTSET != 0 && preempts(15)) {
+        if (icsr & ICSR_PENDSVSET != 0 && preempts(14))
+            || (icsr & ICSR_PENDSTSET != 0 && preempts(15))
+        {
             return true;
         }
         (0..NVIC_BIT_WORDS).any(|w| {
-            let pending = self.ppb.nvic_ispr[w].load(Ordering::Relaxed) | (unmerged >> (32 * w)) as u32;
+            let pending =
+                self.ppb.nvic_ispr[w].load(Ordering::Relaxed) | (unmerged >> (32 * w)) as u32;
             let mut ready = self.ppb.nvic_iser[w].load(Ordering::Relaxed) & pending;
             while ready != 0 {
                 let irq = w as u16 * 32 + ready.trailing_zeros() as u16;

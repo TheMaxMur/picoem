@@ -2423,7 +2423,9 @@ mod stage5_lib_residue {
         emu.bus.memory.sram_write16(0, 0xBF20); // wfe
         emu.bus.memory.sram_write16(2, 0xE7FE); // b .
         emu.bus.memory.sram_write16(0x100, 0xE7FE); // IRQ 3 handler: b .
-        emu.bus.memory.sram_write32(0x200 + 4 * (16 + 3), 0x2000_0101);
+        emu.bus
+            .memory
+            .sram_write32(0x200 + 4 * (16 + 3), 0x2000_0101);
         emu.core_mut(1).halt();
         let c = emu.core_mut(0);
         c.ppb.vtor = 0x2000_0200;
@@ -2458,7 +2460,9 @@ mod stage5_lib_residue {
         emu.bus.memory.sram_write16(0, 0x6001); // str r1, [r0]
         emu.bus.memory.sram_write16(2, 0xE7FE); // b .
         emu.bus.memory.sram_write16(0x100, 0xE7FE); // handler: b .
-        emu.bus.memory.sram_write32(0x200 + 4 * (16 + 48), 0x2000_0101);
+        emu.bus
+            .memory
+            .sram_write32(0x200 + 4 * (16 + 48), 0x2000_0101);
         emu.core_mut(1).halt();
         let c = emu.core_mut(0);
         c.ppb.vtor = 0x2000_0200;
@@ -2493,7 +2497,11 @@ mod stage5_lib_residue {
         assert_eq!(c.regs.r[2], 0xC0, "byte read-back");
         assert_eq!(c.ppb.exception_priority(16 + 10), 0xC0);
         assert_eq!(c.ppb.exception_priority(14), 0xC0);
-        assert_eq!(c.ppb.exception_priority(16 + 11), 0, "neighbour lane untouched");
+        assert_eq!(
+            c.ppb.exception_priority(16 + 11),
+            0,
+            "neighbour lane untouched"
+        );
     }
 
     /// Masked or disabled interrupts are no wake-up event.

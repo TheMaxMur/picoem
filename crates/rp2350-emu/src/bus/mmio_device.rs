@@ -191,10 +191,7 @@ impl Bus {
         device: D,
     ) -> Result<MmioHandle, MountError> {
         let end = base as u64 + size as u64;
-        if size == 0
-            || !PERIPHERAL_WINDOW.contains(&(base as u64))
-            || end > PERIPHERAL_WINDOW.end
-        {
+        if size == 0 || !PERIPHERAL_WINDOW.contains(&(base as u64)) || end > PERIPHERAL_WINDOW.end {
             return Err(MountError::OutsidePeripheralWindow);
         }
         if aliasing == MmioAliasing::Atomic
@@ -231,17 +228,14 @@ impl Bus {
     /// gate on `!external_mmio.is_empty()` and the 0x4/0x5 region first.
     #[inline]
     pub(crate) fn find_mmio(&self, addr: u32) -> Option<(usize, u32, u32)> {
-        self.external_mmio
-            .iter()
-            .enumerate()
-            .find_map(|(i, m)| {
-                let (canonical, alias) = match m.aliasing {
-                    MmioAliasing::Atomic => (addr & !0x3000, (addr >> 12) & 3),
-                    MmioAliasing::Flat => (addr, 0),
-                };
-                let offset = canonical.wrapping_sub(m.base);
-                (canonical >= m.base && offset < m.size).then_some((i, offset, alias))
-            })
+        self.external_mmio.iter().enumerate().find_map(|(i, m)| {
+            let (canonical, alias) = match m.aliasing {
+                MmioAliasing::Atomic => (addr & !0x3000, (addr >> 12) & 3),
+                MmioAliasing::Flat => (addr, 0),
+            };
+            let offset = canonical.wrapping_sub(m.base);
+            (canonical >= m.base && offset < m.size).then_some((i, offset, alias))
+        })
     }
 
     fn mmio_ctx(&self, core: u8) -> MmioCtx {
@@ -256,7 +250,9 @@ impl Bus {
     /// Route a read to mount `index`; raises the IRQs it asks for.
     pub(crate) fn mmio_read(&mut self, index: usize, offset: u32, size: u8, core: u8) -> u32 {
         let mut ctx = self.mmio_ctx(core);
-        let value = self.external_mmio[index].device.read(offset, size, &mut ctx);
+        let value = self.external_mmio[index]
+            .device
+            .read(offset, size, &mut ctx);
         self.raise_irqs_u64(ctx.raise_irqs);
         value
     }
@@ -302,8 +298,17 @@ mod tests {
     /// One access as the device saw it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Seen {
-        Read { offset: u32, size: u8, core: u8 },
-        Write { offset: u32, value: u32, size: u8, alias: u32 },
+        Read {
+            offset: u32,
+            size: u8,
+            core: u8,
+        },
+        Write {
+            offset: u32,
+            value: u32,
+            size: u8,
+            alias: u32,
+        },
     }
 
     /// Four plain-storage registers; a write to register 3 raises
@@ -539,9 +544,7 @@ mod tests {
         // r0 = BASE; ldr r1, [r0]; str r1, [r0, #8]; b .
         let prog: [u16; 3] = [0x6801, 0x6081, 0xE7FE];
         for (i, hw) in prog.iter().enumerate() {
-            emu.bus
-                .memory
-                .sram_write16((i * 2) as u32, *hw);
+            emu.bus.memory.sram_write16((i * 2) as u32, *hw);
         }
         emu.core_mut(1).halt();
         emu.core_mut(0).regs.r[0] = BASE;
@@ -577,8 +580,12 @@ mod tests {
             Err(MountError::NotOneRegisterBlock)
         );
         // The window's top edge is reachable.
-        assert!(emu.mount_mmio(0x5FFF_FFFC, 4, MmioAliasing::Flat, d()).is_ok());
-        emu.mount_mmio(BASE, 0x10, MmioAliasing::Atomic, d()).unwrap();
+        assert!(
+            emu.mount_mmio(0x5FFF_FFFC, 4, MmioAliasing::Flat, d())
+                .is_ok()
+        );
+        emu.mount_mmio(BASE, 0x10, MmioAliasing::Atomic, d())
+            .unwrap();
         // An Atomic mount claims its aliases: a flat mount there overlaps.
         assert_eq!(
             emu.mount_mmio(BASE + 0x3008, 4, MmioAliasing::Flat, d()),
@@ -589,8 +596,14 @@ mod tests {
             Err(MountError::Overlap)
         );
         // Disjoint registers of the same block, aliases included, do not.
-        assert!(emu.mount_mmio(BASE + 0x10, 4, MmioAliasing::Atomic, d()).is_ok());
-        assert!(emu.mount_mmio(BASE + 0x3014, 4, MmioAliasing::Flat, d()).is_ok());
+        assert!(
+            emu.mount_mmio(BASE + 0x10, 4, MmioAliasing::Atomic, d())
+                .is_ok()
+        );
+        assert!(
+            emu.mount_mmio(BASE + 0x3014, 4, MmioAliasing::Flat, d())
+                .is_ok()
+        );
     }
 
     #[test]

@@ -472,7 +472,8 @@ impl Ppb {
             0xEF00 => {
                 let irq = val & 0x1FF;
                 if irq < crate::irq::IRQ_COUNT {
-                    self.nvic_ispr[(irq / 32) as usize].fetch_or(1 << (irq % 32), Ordering::Relaxed);
+                    self.nvic_ispr[(irq / 32) as usize]
+                        .fetch_or(1 << (irq % 32), Ordering::Relaxed);
                 }
             }
 
