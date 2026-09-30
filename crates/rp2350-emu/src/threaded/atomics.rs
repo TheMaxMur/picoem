@@ -14,7 +14,7 @@
 //!     the WFE-waker-side.
 //!   * `take_irq_pending` swaps the mask to zero with `AcqRel` — the
 //!     non-zero return replaces V5's `irq_pending_dirty` flag.
-//!   * `rcp_count_check` is a CAS loop guarding the shared counter;
+//!   * `rcp_count_check` is a CAS loop guarding a core's counter;
 //!     readers use `Acquire`, the CAS uses `AcqRel` on success and
 //!     `Acquire` on failure.
 
@@ -39,10 +39,12 @@ pub struct CoreAtomics {
     pub rcp_salt: [AtomicU32; 2],
     /// Per-core RCP salt validity flag.
     pub rcp_salt_valid: [AtomicBool; 2],
-    /// RCP redundancy counter — single shared counter across both cores.
-    /// `rcp_count_set` initialises; [`Self::rcp_count_check`] asserts
-    /// counter == expected then increments (CAS loop).
-    pub rcp_count: AtomicU32,
+    /// Per-core RCP sequence counter. Each core's RCP counts its own
+    /// steps: the bootrom's core 1 sets its counter while core 0 is
+    /// between a set and a check of its own. `rcp_count_set` initialises;
+    /// [`Self::rcp_count_check`] asserts counter == expected then
+    /// increments (CAS loop).
+    pub rcp_count: [AtomicU32; 2],
     /// Per-core precise bus-fault flag. Observed by `CortexM33::step`
     /// after a data-side access; escalated to BusFault/HardFault.
     pub bus_fault: [AtomicBool; 2],
@@ -59,7 +61,7 @@ impl Default for CoreAtomics {
             irq_pending: [AtomicU64::new(0), AtomicU64::new(0)],
             rcp_salt: [AtomicU32::new(0), AtomicU32::new(0)],
             rcp_salt_valid: [AtomicBool::new(false), AtomicBool::new(false)],
-            rcp_count: AtomicU32::new(0),
+            rcp_count: [AtomicU32::new(0), AtomicU32::new(0)],
             bus_fault: [AtomicBool::new(false), AtomicBool::new(false)],
             bus_fault_addr: [AtomicU32::new(0), AtomicU32::new(0)],
         }
@@ -188,8 +190,8 @@ impl CoreAtomics {
     // --- RCP ---
 
     #[inline]
-    pub fn rcp_count_set(&self, value: u32) {
-        self.rcp_count.store(value, Ordering::Release);
+    pub fn rcp_count_set(&self, core: usize, value: u32) {
+        self.rcp_count[core].store(value, Ordering::Release);
     }
 
     /// CAS-guarded check-and-increment. Returns `Ok(())` if the counter
@@ -198,13 +200,13 @@ impl CoreAtomics {
     /// only on spurious CAS failure where the reloaded value still
     /// matches the expectation.
     #[inline]
-    pub fn rcp_count_check(&self, expected: u32) -> Result<(), u32> {
+    pub fn rcp_count_check(&self, core: usize, expected: u32) -> Result<(), u32> {
         loop {
-            let cur = self.rcp_count.load(Ordering::Acquire);
+            let cur = self.rcp_count[core].load(Ordering::Acquire);
             if cur != expected {
                 return Err(cur);
             }
-            match self.rcp_count.compare_exchange(
+            match self.rcp_count[core].compare_exchange(
                 cur,
                 cur.wrapping_add(1),
                 Ordering::AcqRel,
@@ -217,8 +219,8 @@ impl CoreAtomics {
     }
 
     #[inline]
-    pub fn rcp_count_load(&self) -> u32 {
-        self.rcp_count.load(Ordering::Acquire)
+    pub fn rcp_count_load(&self, core: usize) -> u32 {
+        self.rcp_count[core].load(Ordering::Acquire)
     }
 
     #[inline]
@@ -274,8 +276,8 @@ impl CoreAtomics {
             self.rcp_salt_valid[c].store(false, Ordering::Release);
             self.bus_fault[c].store(false, Ordering::Release);
             self.bus_fault_addr[c].store(0, Ordering::Release);
+            self.rcp_count[c].store(0, Ordering::Release);
         }
-        self.rcp_count.store(0, Ordering::Release);
     }
 
     /// Set the full IRQ pending mask for `core` (used by NVIC sync paths).
@@ -301,8 +303,8 @@ mod tests {
             assert_eq!(a.rcp_salt_load(c), 0);
             assert!(!a.is_bus_fault(c));
             assert_eq!(a.bus_fault_addr(c), 0);
+            assert_eq!(a.rcp_count_load(c), 0);
         }
-        assert_eq!(a.rcp_count_load(), 0);
     }
 
     #[test]
@@ -357,17 +359,30 @@ mod tests {
     #[test]
     fn rcp_count_check_success_increments() {
         let a = CoreAtomics::default();
-        a.rcp_count_set(0xC0);
-        assert_eq!(a.rcp_count_check(0xC0), Ok(()));
-        assert_eq!(a.rcp_count_load(), 0xC1);
+        a.rcp_count_set(0, 0xC0);
+        assert_eq!(a.rcp_count_check(0, 0xC0), Ok(()));
+        assert_eq!(a.rcp_count_load(0), 0xC1);
+    }
+
+    /// Each core owns its counter: core 1 setting and checking its own
+    /// step must not move core 0's, which sits between a set and a check.
+    #[test]
+    fn rcp_count_is_per_core() {
+        let a = CoreAtomics::default();
+        a.rcp_count_set(0, 0x05);
+        a.rcp_count_set(1, 0x80);
+        assert_eq!(a.rcp_count_check(1, 0x80), Ok(()));
+        assert_eq!(a.rcp_count_check(0, 0x05), Ok(()));
+        assert_eq!(a.rcp_count_load(0), 0x06);
+        assert_eq!(a.rcp_count_load(1), 0x81);
     }
 
     #[test]
     fn rcp_count_check_mismatch_returns_err() {
         let a = CoreAtomics::default();
-        a.rcp_count_set(0xC0);
-        assert_eq!(a.rcp_count_check(0xC5), Err(0xC0));
-        assert_eq!(a.rcp_count_load(), 0xC0, "count unchanged on mismatch");
+        a.rcp_count_set(0, 0xC0);
+        assert_eq!(a.rcp_count_check(0, 0xC5), Err(0xC0));
+        assert_eq!(a.rcp_count_load(0), 0xC0, "count unchanged on mismatch");
     }
 
     #[test]
@@ -461,7 +476,7 @@ mod tests {
         use std::thread;
 
         let a = Arc::new(CoreAtomics::default());
-        a.rcp_count_set(0);
+        a.rcp_count_set(0, 0);
 
         // Spawn a disruptor that increments the counter from another
         // thread. Even if the main thread's CAS succeeds first try, a
@@ -471,7 +486,7 @@ mod tests {
             let a = a.clone();
             thread::spawn(move || {
                 for _ in 0..1000 {
-                    let _ = a.rcp_count.fetch_add(1, Ordering::AcqRel);
+                    let _ = a.rcp_count[0].fetch_add(1, Ordering::AcqRel);
                 }
             })
         };
@@ -479,14 +494,14 @@ mod tests {
         // Try the check repeatedly; every success or mismatch exercises
         // the two terminal arms.
         for _ in 0..1000 {
-            let expected = a.rcp_count_load();
-            let _ = a.rcp_count_check(expected);
+            let expected = a.rcp_count_load(0);
+            let _ = a.rcp_count_check(0, expected);
         }
         disruptor.join().unwrap();
 
         // Final state: counter is monotonically advanced; no assertion
         // needed beyond "didn't deadlock / panic".
-        assert!(a.rcp_count_load() >= 1000);
+        assert!(a.rcp_count_load(0) >= 1000);
     }
 
     #[test]
@@ -503,7 +518,8 @@ mod tests {
         a.assert_irq(1, 5);
         a.rcp_salt_set(0, 0xAAAA_1111);
         a.rcp_salt_set(1, 0x5555_BBBB);
-        a.rcp_count_set(0x1234_5678);
+        a.rcp_count_set(0, 0x1234_5678);
+        a.rcp_count_set(1, 0x8765_4321);
         a.set_bus_fault(0, 0xCAFE_F00D);
         a.set_bus_fault(1, 0xDEAD_BEEF);
 
@@ -518,7 +534,7 @@ mod tests {
             assert!(!a.rcp_salt_is_valid(c), "rcp_salt_valid[{}] not cleared", c);
             assert!(!a.is_bus_fault(c), "bus_fault[{}] not cleared", c);
             assert_eq!(a.bus_fault_addr(c), 0, "bus_fault_addr[{}] not cleared", c);
+            assert_eq!(a.rcp_count_load(c), 0, "rcp_count[{}] not cleared", c);
         }
-        assert_eq!(a.rcp_count_load(), 0, "rcp_count not cleared");
     }
 }

@@ -632,14 +632,14 @@ impl CortexM33 {
                 self.pending_fault = Some(Fault::Nmi);
             }
             (4, 0) => {
-                // rcp_count_init imm — set the redundancy counter to imm.
+                // rcp_count_init imm — set this core's counter to imm.
                 self.atomics
-                    .rcp_count_set(((crn as u32) << 4) | (crm as u32));
+                    .rcp_count_set(core, ((crn as u32) << 4) | (crm as u32));
             }
             (5, 1) => {
                 // rcp_count_check imm — assert counter == imm, then increment.
                 let expected = ((crn as u32) << 4) | (crm as u32);
-                if self.atomics.rcp_count_check(expected).is_err() {
+                if self.atomics.rcp_count_check(core, expected).is_err() {
                     self.pending_fault = Some(Fault::Nmi);
                 }
             }
@@ -1403,21 +1403,54 @@ mod tests {
         let (crn, crm) = split_imm8(0xc0);
         let (hw0, hw1) = encode_mcr2_full(7, 4, crn, 0, 0, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
-        assert_eq!(bus.atomics.rcp_count_load(), 0xc0);
+        assert_eq!(bus.atomics.rcp_count_load(0), 0xc0);
         assert!(cpu.pending_fault.is_none());
 
         // count_check 0xc0 -> pass, increments to 0xc1
         let (hw0, hw1) = encode_mcr2_full(7, 5, crn, 0, 1, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
-        assert_eq!(bus.atomics.rcp_count_load(), 0xc1);
+        assert_eq!(bus.atomics.rcp_count_load(0), 0xc1);
 
         // count_check 0xc1 -> pass, increments to 0xc2
         let (crn, crm) = split_imm8(0xc1);
         let (hw0, hw1) = encode_mcr2_full(7, 5, crn, 0, 1, crm);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
-        assert_eq!(bus.atomics.rcp_count_load(), 0xc2);
+        assert_eq!(bus.atomics.rcp_count_load(0), 0xc2);
+    }
+
+    /// The bootrom's core 1 sets its own step (`rcp_count_set
+    /// STEPTAG_ASM_C1_BOOTPATH`) as soon as core 0 seeds its salt, while
+    /// core 0 sits between `hx_set_step(5)` and `hx_check_step(5)`. Each
+    /// core's RCP counts its own steps, so core 0's check still passes.
+    #[test]
+    fn test_rcp_count_is_per_core_across_an_interleaved_set() {
+        let atomics = std::sync::Arc::new(crate::threaded::CoreAtomics::default());
+        let mut c0 = CortexM33::new(0, std::sync::Arc::clone(&atomics));
+        let mut c1 = CortexM33::new(1, std::sync::Arc::clone(&atomics));
+        let mut bus = Bus::with_atomics(std::sync::Arc::clone(&atomics));
+        enable_cp(&mut c0, 7);
+        enable_cp(&mut c1, 7);
+        atomics.rcp_salt_set(0, 0x1111_2222);
+        atomics.rcp_salt_set(1, 0x3333_4444);
+
+        let set = |imm: u8| encode_mcr2_full(7, 4, imm >> 4, 0, 0, imm & 0xF);
+        let check = |imm: u8| encode_mcr2_full(7, 5, imm >> 4, 0, 1, imm & 0xF);
+
+        let (h0, h1) = set(0x05);
+        c0.thumb32_coprocessor(h0, h1, &mut bus);
+        let (h0, h1) = set(0x80);
+        c1.thumb32_coprocessor(h0, h1, &mut bus);
+        let (h0, h1) = check(0x80);
+        c1.thumb32_coprocessor(h0, h1, &mut bus);
+        assert!(c1.pending_fault.is_none(), "core 1 checks its own step");
+        let (h0, h1) = check(0x05);
+        c0.thumb32_coprocessor(h0, h1, &mut bus);
+        assert!(
+            c0.pending_fault.is_none(),
+            "core 1's set must not move core 0's counter"
+        );
     }
 
     #[test]
