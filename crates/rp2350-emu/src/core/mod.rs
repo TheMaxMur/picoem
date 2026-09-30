@@ -946,11 +946,17 @@ impl CortexM33 {
     pub(crate) fn bus_read8<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u8 {
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            // PPB registers are word-access-only; byte reads return 0.
+            // PPB registers are word-access-only; byte reads return 0 —
+            // except the byte-accessible priority registers.
+            let val = if Self::is_byte_accessible_ppb(addr) {
+                (self.ppb.read32(addr & !3) >> ((addr & 3) * 8)) as u8
+            } else {
+                0
+            };
             if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('R', 1, addr, 0, self.core_id);
+                bus.emit_mmio_trace('R', 1, addr, val as u32, self.core_id);
             }
-            0
+            val
         } else if Self::is_sio_local(addr) {
             // Matches the pre-Stage-3 `Bus::read8` 0xD path: read the
             // containing 32-bit SIO register and slice the byte.
@@ -966,12 +972,27 @@ impl CortexM33 {
         }
     }
 
+    /// NVIC_IPRn and SCB_SHPR1-3: the PPB registers Armv8-M makes
+    /// byte-accessible, which is how CMSIS `NVIC_SetPriority` (and
+    /// embassy's `set_priority`) write a priority.
+    fn is_byte_accessible_ppb(addr: u32) -> bool {
+        matches!(addr, 0xE000_E400..=0xE000_E5EF | 0xE000_ED18..=0xE000_ED23)
+    }
+
     pub(crate) fn bus_write8<B: CoreBus>(&mut self, addr: u32, val: u8, bus: &mut B) {
         self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            // PPB registers are word-access-only; byte writes drop.
+            // PPB registers are word-access-only; byte writes drop —
+            // except the byte-accessible priority registers, which take
+            // the byte in their lane.
+            if Self::is_byte_accessible_ppb(addr) {
+                let shift = (addr & 3) * 8;
+                let old = self.ppb.read32(addr & !3);
+                self.ppb
+                    .write32(addr & !3, (old & !(0xFF << shift)) | ((val as u32) << shift));
+            }
             if bus.mmio_trace_enabled() {
                 bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);
             }

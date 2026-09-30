@@ -2473,6 +2473,29 @@ mod stage5_lib_residue {
         assert_eq!(emu.core(0).regs.ipsr(), 16 + 48);
     }
 
+    /// Priorities are set a byte at a time (`strb` to NVIC_IPRn / SHPRn,
+    /// as CMSIS and embassy do) and read back the same way.
+    #[test]
+    fn priority_registers_take_byte_access() {
+        let mut emu = Emulator::new(Config::default());
+        // strb r1, [r0]; strb r1, [r3]; ldrb r2, [r0]; b .
+        for (i, hw) in [0x7001u16, 0x7019, 0x7802, 0xE7FE].iter().enumerate() {
+            emu.bus.memory.sram_write16((i * 2) as u32, *hw);
+        }
+        emu.core_mut(1).halt();
+        let c = emu.core_mut(0);
+        c.regs.r[0] = 0xE000_E40A; // IRQ 10's IPR byte
+        c.regs.r[1] = 0xC0;
+        c.regs.r[3] = 0xE000_ED22; // SHPR3 byte 2: PendSV
+        c.regs.set_pc(0x2000_0000);
+        emu.step().unwrap();
+        let c = emu.core(0);
+        assert_eq!(c.regs.r[2], 0xC0, "byte read-back");
+        assert_eq!(c.ppb.exception_priority(16 + 10), 0xC0);
+        assert_eq!(c.ppb.exception_priority(14), 0xC0);
+        assert_eq!(c.ppb.exception_priority(16 + 11), 0, "neighbour lane untouched");
+    }
+
     /// Masked or disabled interrupts are no wake-up event.
     #[test]
     fn wfe_stays_asleep_for_interrupts_that_cannot_preempt() {
