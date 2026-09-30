@@ -598,6 +598,12 @@ impl CortexM33 {
                         self.regs.r[rt] = status;
                     }
                 }
+                (2, 0) => {
+                    // rcp_random_byte: 8 bits from the salt-seeded PRNG.
+                    // The bootrom's OTP rbit3 read uses it as a 0..=3
+                    // delay-loop count and dies unless the loop ends at -1.
+                    self.regs.r[rt] = self.atomics.rcp_random_byte(core);
+                }
                 _ => {} // unrecognized MRC: silent NOP
             }
             return 1;
@@ -712,14 +718,9 @@ impl CortexM33 {
             }
             8 => {
                 match crm {
-                    0 => {
-                        // rcp_salt_core0
-                        self.atomics.rcp_salt_set(0, self.regs.r[rt]);
-                    }
-                    1 => {
-                        // rcp_salt_core1
-                        self.atomics.rcp_salt_set(1, self.regs.r[rt]);
-                    }
+                    // rcp_salt_core0 / rcp_salt_core1: the 64-bit salt Rt2:Rt.
+                    0 => self.atomics.rcp_salt_set64(0, a, b),
+                    1 => self.atomics.rcp_salt_set64(1, a, b),
                     _ => {} // unrecognized salt CRm: silent NOP
                 }
             }
@@ -1488,6 +1489,28 @@ mod tests {
             mcrr_check_nmis(2, 0, t, 0),
             "rcp_b2or: an invalid operand must NMI"
         );
+    }
+
+    // ---------- rcp_random_byte ----------
+
+    /// The bootrom's `s_varm_step_safe_otp_read_rbit3_guarded` delay loop:
+    /// `negs r3, r3; mrc2 p7, #2, r3; asrs r3, #6; 1: subs r3, #1; bpl 1b;
+    /// adds r3, #1` then folds r3 into a canary, so r3 must come back as
+    /// a byte (0..=255) for the loop to end at -1.
+    #[test]
+    fn test_rcp_random_byte_returns_a_byte_from_the_salted_prng() {
+        let (mut cpu, mut bus) = rcp_setup();
+        bus.atomics.rcp_salt_set64(0, 0x1234_5678, 0xCAFE_F00D);
+        let (hw0, hw1) = encode_mrc2_full(7, 2, 0, 3, 0, 0);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            cpu.regs.r[3] = 0xBFFC_0000u32.wrapping_neg(); // -(OTP raw guarded base)
+            cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+            assert!(cpu.regs.r[3] <= 0xFF, "got {:#x}", cpu.regs.r[3]);
+            seen.insert(cpu.regs.r[3]);
+        }
+        assert!(cpu.pending_fault.is_none());
+        assert!(seen.len() > 16, "the PRNG must step: {seen:?}");
     }
 
     // ---------- rcp_canary_status into a general register ----------

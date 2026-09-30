@@ -39,6 +39,9 @@ pub struct CoreAtomics {
     pub rcp_salt: [AtomicU32; 2],
     /// Per-core RCP salt validity flag.
     pub rcp_salt_valid: [AtomicBool; 2],
+    /// Per-core RCP PRNG state behind `rcp_random_byte`, seeded from the
+    /// upper 24 bits of the core's 64-bit salt when the salt is written.
+    pub rcp_rand: [AtomicU32; 2],
     /// Per-core RCP sequence counter. Each core's RCP counts its own
     /// steps: the bootrom's core 1 sets its counter while core 0 is
     /// between a set and a check of its own. `rcp_count_set` initialises;
@@ -61,6 +64,7 @@ impl Default for CoreAtomics {
             irq_pending: [AtomicU64::new(0), AtomicU64::new(0)],
             rcp_salt: [AtomicU32::new(0), AtomicU32::new(0)],
             rcp_salt_valid: [AtomicBool::new(false), AtomicBool::new(false)],
+            rcp_rand: [AtomicU32::new(0), AtomicU32::new(0)],
             rcp_count: [AtomicU32::new(0), AtomicU32::new(0)],
             bus_fault: [AtomicBool::new(false), AtomicBool::new(false)],
             bus_fault_addr: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -225,8 +229,30 @@ impl CoreAtomics {
 
     #[inline]
     pub fn rcp_salt_set(&self, core: usize, value: u32) {
-        self.rcp_salt[core].store(value, Ordering::Release);
+        self.rcp_salt_set64(core, value, 0);
+    }
+
+    /// Seed `core`'s salt with the 64-bit value `hi:lo`, as the MCRR salt
+    /// writes do; the upper 24 bits seed the core's RCP PRNG.
+    #[inline]
+    pub fn rcp_salt_set64(&self, core: usize, lo: u32, hi: u32) {
+        self.rcp_salt[core].store(lo, Ordering::Release);
+        self.rcp_rand[core].store(hi >> 8, Ordering::Release);
         self.rcp_salt_valid[core].store(true, Ordering::Release);
+    }
+
+    /// Step `core`'s RCP PRNG and return 8 bits of it
+    /// (`rcp_random_byte`). A splitmix32 step: any seed, zero included,
+    /// gives a full-period sequence.
+    #[inline]
+    pub fn rcp_random_byte(&self, core: usize) -> u32 {
+        let s = self.rcp_rand[core]
+            .fetch_add(0x9E37_79B9, Ordering::AcqRel)
+            .wrapping_add(0x9E37_79B9);
+        let mut z = s;
+        z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
+        z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
+        (z ^ (z >> 16)) >> 24
     }
 
     #[inline]
@@ -274,6 +300,7 @@ impl CoreAtomics {
             self.irq_pending[c].store(0, Ordering::Release);
             self.rcp_salt[c].store(0, Ordering::Release);
             self.rcp_salt_valid[c].store(false, Ordering::Release);
+            self.rcp_rand[c].store(0, Ordering::Release);
             self.bus_fault[c].store(false, Ordering::Release);
             self.bus_fault_addr[c].store(0, Ordering::Release);
             self.rcp_count[c].store(0, Ordering::Release);
