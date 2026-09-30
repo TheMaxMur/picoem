@@ -2034,15 +2034,33 @@ mod mrs_msr {
         let _ = c.reg(0);
     }
 
-    /// MRS MSP (SYSm=8).
+    /// MRS MSP (SYSm=8) with MSP the active stack pointer reads the live
+    /// SP, not the banked copy last synced on a switch: a push since then
+    /// moved it (a stack sweep bounded by a stale MSP zeroed its own frame).
     #[test]
     fn mrs_msp() {
         let mut c = CortexM33::for_test(0);
-        c.regs.msp = 0x2000_ABCD;
+        c.regs.msp = 0x2000_ABD0;
+        c.regs.r[13] = 0x2000_ABC0;
         let hw0 = 0xF3EFu16;
         let hw1 = 0x8000u16 | 8;
         c.execute_one_wide(hw0, hw1);
+        assert_eq!(c.reg(0), 0x2000_ABC0);
+    }
+
+    /// With PSP active (thread mode, SPSEL), MRS PSP reads the live SP and
+    /// MRS MSP the banked main stack pointer.
+    #[test]
+    fn mrs_psp_live_msp_banked_under_spsel() {
+        let mut c = CortexM33::for_test(0);
+        c.regs.control = 0x2;
+        c.regs.msp = 0x2000_ABCD;
+        c.regs.psp = 0x2000_1200;
+        c.regs.r[13] = 0x2000_11F0;
+        c.execute_one_wide(0xF3EF, 0x8000 | 8);
         assert_eq!(c.reg(0), 0x2000_ABCD);
+        c.execute_one_wide(0xF3EF, 0x8100 | 9);
+        assert_eq!(c.reg(1), 0x2000_11F0);
     }
 
     /// MRS PSP (SYSm=9).

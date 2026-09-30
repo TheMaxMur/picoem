@@ -1237,9 +1237,11 @@ impl CortexM33 {
             6 => 0,
             // IEPSR — IPSR bits (IT/ICI masked)
             7 => self.regs.xpsr & 0x0700_01FF,
-            // MSP
+            // MSP / PSP: the live R13 when that stack pointer is the active
+            // one (the banked copy is only refreshed on a switch).
+            8 if !self.regs.active_sp_is_psp() => self.regs.r[13],
             8 => self.regs.msp,
-            // PSP
+            9 if self.regs.active_sp_is_psp() => self.regs.r[13],
             9 => self.regs.psp,
             // MSPLIM
             10 => self.regs.msplim,
