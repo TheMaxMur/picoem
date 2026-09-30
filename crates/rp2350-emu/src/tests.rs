@@ -21230,12 +21230,16 @@ mod stage7_ppb_coverage {
         assert_eq!(ppb.read32(0xE000_EF3C), 0xCAFE_BABE);
     }
 
+    /// The RP2350's M33 has 8 MPU regions per security state (DREGION 8,
+    /// pico-sdk `M33_MPU_TYPE_RESET`); the A2 bootrom checks MPU_TYPE
+    /// against 0x800 and raises an RCP fault on anything else.
     #[test]
     fn mpu_type_read() {
         let mut ppb = Ppb::default();
-        assert_eq!(ppb.read32(0xE000_ED90), 0x0000_1000);
+        assert_eq!(ppb.read32(0xE000_ED90), 0x0000_0800);
         ppb.write32(0xE000_ED90, 0xFFFF);
-        assert_eq!(ppb.read32(0xE000_ED90), 0x0000_1000);
+        assert_eq!(ppb.read32(0xE000_ED90), 0x0000_0800);
+        assert_eq!(ppb.read32_ns(0xE000_ED90), 0x0000_0800);
     }
 
     #[test]
@@ -21244,8 +21248,8 @@ mod stage7_ppb_coverage {
         ppb.write32(0xE000_ED94, 0x7);
         assert_eq!(ppb.read32(0xE000_ED94), 0x7);
         ppb.write32(0xE000_ED98, 0xFF);
-        // Masked to 4 bits.
-        assert_eq!(ppb.read32(0xE000_ED98), 0xF);
+        // Masked to 3 bits (M33_MPU_RNR_BITS).
+        assert_eq!(ppb.read32(0xE000_ED98), 0x7);
     }
 
     #[test]

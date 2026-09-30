@@ -70,7 +70,7 @@ pub struct NsBank {
     pub cpacr: u32,
     pub mpu_ctrl: u32,
     pub mpu_rnr: u32,
-    pub mpu_regions: [(u32, u32); 16],
+    pub mpu_regions: [(u32, u32); MPU_REGIONS],
     /// The Non-secure SysTick's registers: stored, not counted.
     pub syst_csr: u32,
     pub syst_rvr: u32,
@@ -90,7 +90,7 @@ impl Default for NsBank {
             cpacr: 0,
             mpu_ctrl: 0,
             mpu_rnr: 0,
-            mpu_regions: [(0, 0); 16],
+            mpu_regions: [(0, 0); MPU_REGIONS],
             syst_csr: 0,
             syst_rvr: 0,
             syst_cvr: 0,
@@ -98,18 +98,25 @@ impl Default for NsBank {
     }
 }
 
-/// MPU_TYPE: 16 regions on RP2350 Cortex-M33 (both banks).
-const MPU_TYPE: u32 = 0x0000_1000;
+/// MPU regions per security state: the RP2350's Cortex-M33 has 8
+/// (pico-sdk `M33_MPU_TYPE_RESET` 0x800, `M33_MPU_RNR_BITS` 0x7; the A2
+/// bootrom checks MPU_TYPE against 0x800 before enabling the MPU).
+pub const MPU_REGIONS: usize = 8;
+/// MPU_TYPE: DREGION = 8, unified (both banks).
+const MPU_TYPE: u32 = (MPU_REGIONS as u32) << 8;
+const MPU_RNR_MASK: u32 = MPU_REGIONS as u32 - 1;
 
 /// An MPU register read, for either bank: `None` if `off` is not one.
-fn mpu_read(ctrl: u32, rnr: u32, regions: &[(u32, u32); 16], off: u32) -> Option<u32> {
-    let alias = |first: u32| ((rnr as usize & !0x3) | ((off - first) / 8 + 1) as usize) & 0xF;
+fn mpu_read(ctrl: u32, rnr: u32, regions: &[(u32, u32); MPU_REGIONS], off: u32) -> Option<u32> {
+    let alias = |first: u32| {
+        ((rnr as usize & !0x3) | ((off - first) / 8 + 1) as usize) & MPU_RNR_MASK as usize
+    };
     Some(match off {
         0xED90 => MPU_TYPE,
         0xED94 => ctrl,
         0xED98 => rnr,
-        0xED9C => regions[(rnr & 0xF) as usize].0,
-        0xEDA0 => regions[(rnr & 0xF) as usize].1,
+        0xED9C => regions[(rnr & MPU_RNR_MASK) as usize].0,
+        0xEDA0 => regions[(rnr & MPU_RNR_MASK) as usize].1,
         // RBAR_An / RLAR_An (ARMv8-M §B11.2.5-8) access region
         // `(RNR & !3) | n` for n in 1..=3.
         0xEDA4 | 0xEDAC | 0xEDB4 => regions[alias(0xEDA4)].0,
@@ -123,17 +130,19 @@ fn mpu_read(ctrl: u32, rnr: u32, regions: &[(u32, u32); 16], off: u32) -> Option
 fn mpu_write(
     ctrl: &mut u32,
     rnr: &mut u32,
-    regions: &mut [(u32, u32); 16],
+    regions: &mut [(u32, u32); MPU_REGIONS],
     off: u32,
     val: u32,
 ) -> bool {
-    let alias = |first: u32| ((*rnr as usize & !0x3) | ((off - first) / 8 + 1) as usize) & 0xF;
+    let alias = |first: u32| {
+        ((*rnr as usize & !0x3) | ((off - first) / 8 + 1) as usize) & MPU_RNR_MASK as usize
+    };
     match off {
         0xED90 => {}
         0xED94 => *ctrl = val,
-        0xED98 => *rnr = val & 0xF,
-        0xED9C => regions[(*rnr & 0xF) as usize].0 = val,
-        0xEDA0 => regions[(*rnr & 0xF) as usize].1 = val & !0x10,
+        0xED98 => *rnr = val & MPU_RNR_MASK,
+        0xED9C => regions[(*rnr & MPU_RNR_MASK) as usize].0 = val,
+        0xEDA0 => regions[(*rnr & MPU_RNR_MASK) as usize].1 = val & !0x10,
         0xEDA4 | 0xEDAC | 0xEDB4 => regions[alias(0xEDA4)].0 = val,
         0xEDA8 | 0xEDB0 | 0xEDB8 => regions[alias(0xEDA8)].1 = val & !0x10,
         _ => return false,
@@ -187,9 +196,9 @@ pub struct Ppb {
     pub fpdscr: u32,
 
     // MPU (0xE000ED94-0xE000EDA0)
-    pub mpu_ctrl: u32,                 // MPU Control (0xE000ED94)
-    pub mpu_rnr: u32,                  // MPU Region Number (0xE000ED98)
-    pub mpu_regions: [(u32, u32); 16], // 16 regions: (RBAR, RLAR) pairs
+    pub mpu_ctrl: u32,                          // MPU Control (0xE000ED94)
+    pub mpu_rnr: u32,                           // MPU Region Number (0xE000ED98)
+    pub mpu_regions: [(u32, u32); MPU_REGIONS], // (RBAR, RLAR) pairs
 
     // SAU (0xE000EDD0-0xE000EDE0)
     pub sau_ctrl: u32,                // SAU Control (bit 0 = enable, bit 1 = ALLNS)
@@ -288,7 +297,7 @@ impl Default for Ppb {
             fpdscr: 0,
             mpu_ctrl: 0,
             mpu_rnr: 0,
-            mpu_regions: [(0, 0); 16],
+            mpu_regions: [(0, 0); MPU_REGIONS],
             sau_ctrl: 0,
             sau_rnr: 0,
             sau_regions: [(0, 0); 8],

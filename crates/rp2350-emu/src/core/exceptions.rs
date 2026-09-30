@@ -966,7 +966,7 @@ impl CortexM33 {
         if ctrl & 1 == 0 {
             return (true, true, None);
         }
-        let hit = (0..16u8).find(|&i| {
+        let hit = (0..crate::bus::ppb::MPU_REGIONS as u8).find(|&i| {
             let (rbar, rlar) = regions[i as usize];
             rlar & 1 != 0 && addr >= rbar & !0x1F && addr <= (rlar & !0x1F) | 0x1F
         });
