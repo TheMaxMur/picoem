@@ -583,15 +583,20 @@ impl CortexM33 {
                     // with the same tag and relies only on consistency).
                     self.regs.r[rt] = self.atomics.rcp_salt_load(core) ^ 0xDEAD_BEEF;
                 }
-                (1, 0) if rt == 15 => {
-                    // rcp_canary_status pc: write NZCV to APSR.
-                    // N = salt_valid[core]; Z=0, C=0, V=0.
-                    let n = if self.atomics.rcp_salt_is_valid(core) {
-                        1u32 << 31
+                (1, 0) => {
+                    // rcp_canary_status: the true/false bit pattern for
+                    // "this core's salt is seeded"; Rt=15 moves its top
+                    // nibble into NZCV (true 0xa -> N=1 C=1).
+                    let status = if self.atomics.rcp_salt_is_valid(core) {
+                        RCP_TRUE
                     } else {
-                        0
+                        RCP_FALSE
                     };
-                    self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | n;
+                    if rt == 15 {
+                        self.regs.xpsr = (self.regs.xpsr & 0x0FFF_FFFF) | (status & 0xF000_0000);
+                    } else {
+                        self.regs.r[rt] = status;
+                    }
                 }
                 _ => {} // unrecognized MRC: silent NOP
             }
@@ -616,19 +621,16 @@ impl CortexM33 {
                     self.pending_fault = Some(Fault::Nmi);
                 }
             }
-            (1, 0) => {
-                // rcp_bvalid Rt — assert Rt ∈ {0, 1}.
-                let v = self.regs.r[rt];
-                if v > 1 {
-                    self.pending_fault = Some(Fault::Nmi);
-                }
-            }
-            // rcp_btrue Rt — assert Rt == 1.
-            (2, 0) if self.regs.r[rt] != 1 => {
+            // rcp_bvalid Rt — assert Rt is the true or the false pattern.
+            (1, 0) if !rcp_is_bool(self.regs.r[rt]) => {
                 self.pending_fault = Some(Fault::Nmi);
             }
-            // rcp_bfalse Rt — assert Rt == 0.
-            (3, 1) if self.regs.r[rt] != 0 => {
+            // rcp_btrue Rt — assert Rt == the true pattern.
+            (2, 0) if self.regs.r[rt] != RCP_TRUE => {
+                self.pending_fault = Some(Fault::Nmi);
+            }
+            // rcp_bfalse Rt — assert Rt == the false pattern.
+            (3, 1) if self.regs.r[rt] != RCP_FALSE => {
                 self.pending_fault = Some(Fault::Nmi);
             }
             (4, 0) => {
@@ -685,10 +687,27 @@ impl CortexM33 {
         let rt = ((hw1 >> 12) & 0xF) as usize;
         let rt2 = (hw0 & 0xF) as usize;
 
+        let (a, b) = (self.regs.r[rt], self.regs.r[rt2]);
+        // pico-sdk hardware/rcp.h: opc1 0-6 are the two-operand boolean
+        // and integer assertions, 7 rcp_iequal, 8 the salt writes.
+        let holds = match opc1 {
+            0 => rcp_is_bool(a) && rcp_is_bool(b), // rcp_b2valid
+            1 => a == RCP_TRUE && b == RCP_TRUE,   // rcp_b2and
+            2 => rcp_is_bool(a) && rcp_is_bool(b) && (a == RCP_TRUE || b == RCP_TRUE), // rcp_b2or
+            3 => rcp_is_bool(a ^ b),               // rcp_bxorvalid
+            4 => a ^ b == RCP_TRUE,                // rcp_bxortrue
+            5 => a ^ b == RCP_FALSE,               // rcp_bxorfalse
+            6 => a ^ b == RCP_INTXOR,              // rcp_ivalid
+            _ => true,
+        };
+        if !holds {
+            self.pending_fault = Some(Fault::Nmi);
+            return 1;
+        }
         match opc1 {
             // rcp_iequal Rt, Rt2 — assert Rt == Rt2 (bootrom 0xFC4x_x770).
             // Equal case (assertion holds) falls through to the catch-all.
-            7 if self.regs.r[rt] != self.regs.r[rt2] => {
+            7 if a != b => {
                 self.pending_fault = Some(Fault::Nmi);
             }
             8 => {
@@ -704,20 +723,28 @@ impl CortexM33 {
                     _ => {} // unrecognized salt CRm: silent NOP
                 }
             }
-            _ => {
-                // rcp_b2valid, rcp_bxortrue, rcp_bxorfalse, rcp_ivalid:
-                // bootrom uses these sparingly; silent NOP matches existing
-                // stub behavior (HLD §8.4 skip list).
-            }
+            _ => {}
         }
         1
     }
+}
+
+/// pico-sdk `RCP_MASK_TRUE` / `RCP_MASK_FALSE` / `RCP_MASK_INTXOR`
+/// (hardware/rcp.h): the RCP's hardened boolean encodings, and the XOR
+/// an `rcp_ivalid` integer/parity pair must produce.
+const RCP_TRUE: u32 = 0xa500_a500;
+const RCP_FALSE: u32 = 0x00c3_00c3;
+const RCP_INTXOR: u32 = 0x9600_9600;
+
+fn rcp_is_bool(v: u32) -> bool {
+    v == RCP_TRUE || v == RCP_FALSE
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
 
+    use super::{RCP_FALSE, RCP_INTXOR, RCP_TRUE};
     use crate::bus::Bus;
     use crate::core::CortexM33;
     use crate::core::Fault;
@@ -1332,7 +1359,7 @@ mod tests {
     #[test]
     fn test_rcp_btrue_pass() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[0] = 1;
+        cpu.regs.r[0] = RCP_TRUE;
         let (hw0, hw1) = encode_mcr2_full(7, 2, 0, 0, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
@@ -1341,7 +1368,7 @@ mod tests {
     #[test]
     fn test_rcp_btrue_fail_raises_nmi() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[0] = 0;
+        cpu.regs.r[0] = 1; // a C boolean is not the hardened true pattern
         let (hw0, hw1) = encode_mcr2_full(7, 2, 0, 0, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
@@ -1350,7 +1377,7 @@ mod tests {
     #[test]
     fn test_rcp_bfalse_pass() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[3] = 0;
+        cpu.regs.r[3] = RCP_FALSE;
         let (hw0, hw1) = encode_mcr2_full(7, 3, 0, 3, 1, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
@@ -1359,7 +1386,7 @@ mod tests {
     #[test]
     fn test_rcp_bfalse_fail_raises_nmi() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[3] = 1;
+        cpu.regs.r[3] = 0; // a C boolean is not the hardened false pattern
         let (hw0, hw1) = encode_mcr2_full(7, 3, 0, 3, 1, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
@@ -1368,18 +1395,18 @@ mod tests {
     // ---------- rcp_bvalid ----------
 
     #[test]
-    fn test_rcp_bvalid_pass_zero() {
+    fn test_rcp_bvalid_pass_false_pattern() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[5] = 0;
+        cpu.regs.r[5] = RCP_FALSE;
         let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
     }
 
     #[test]
-    fn test_rcp_bvalid_pass_one() {
+    fn test_rcp_bvalid_pass_true_pattern() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[5] = 1;
+        cpu.regs.r[5] = RCP_TRUE;
         let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
@@ -1388,10 +1415,106 @@ mod tests {
     #[test]
     fn test_rcp_bvalid_fail_raises_nmi() {
         let (mut cpu, mut bus) = rcp_setup();
-        cpu.regs.r[5] = 2;
+        cpu.regs.r[5] = 1;
         let (hw0, hw1) = encode_mcr2_full(7, 1, 0, 5, 0, 0);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(matches!(cpu.pending_fault, Some(Fault::Nmi)));
+    }
+
+    // ---------- two-operand checks (MCRR2 opc1 0-6) ----------
+
+    /// Run one MCRR2 check with `a` in Rt (r2) and `b` in Rt2 (r3) and
+    /// report whether it raised an NMI.
+    fn mcrr_check_nmis(opc1: u8, crm: u8, a: u32, b: u32) -> bool {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.r[2] = a;
+        cpu.regs.r[3] = b;
+        let (hw0, hw1) = encode_mcrr2(7, opc1, 3, 2, crm);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        matches!(cpu.pending_fault, Some(Fault::Nmi))
+    }
+
+    /// pico-sdk hardware/rcp.h semantics, each op on an operand pair
+    /// that holds and one that does not.
+    #[test]
+    fn test_rcp_two_operand_boolean_and_integer_checks() {
+        let (t, f) = (RCP_TRUE, RCP_FALSE);
+        // (name, opc1, crm, holding pair, violating pair)
+        let cases: &[(&str, u8, u8, (u32, u32), (u32, u32))] = &[
+            ("rcp_b2valid", 0, 8, (t, f), (t, 1)),
+            ("rcp_b2and", 1, 0, (t, t), (t, f)),
+            ("rcp_b2or", 2, 0, (f, t), (f, f)),
+            (
+                "rcp_bxorvalid",
+                3,
+                8,
+                (t ^ 0x1234_5678, 0x1234_5678),
+                (0, 1),
+            ),
+            (
+                "rcp_bxortrue",
+                4,
+                0,
+                (t ^ 0x5555_0000, 0x5555_0000),
+                (f ^ 7, 7),
+            ),
+            (
+                "rcp_bxorfalse",
+                5,
+                8,
+                (f ^ 0x00AA_00AA, 0x00AA_00AA),
+                (t ^ 3, 3),
+            ),
+            (
+                "rcp_ivalid",
+                6,
+                8,
+                (0x1234 ^ RCP_INTXOR, 0x1234),
+                (0x1234, 0x1234),
+            ),
+        ];
+        for &(name, opc1, crm, ok, bad) in cases {
+            assert!(
+                !mcrr_check_nmis(opc1, crm, ok.0, ok.1),
+                "{name}: holding pair must pass"
+            );
+            assert!(
+                mcrr_check_nmis(opc1, crm, bad.0, bad.1),
+                "{name}: violating pair must NMI"
+            );
+        }
+        // rcp_b2or also requires both operands to be booleans.
+        assert!(
+            mcrr_check_nmis(2, 0, t, 0),
+            "rcp_b2or: an invalid operand must NMI"
+        );
+    }
+
+    // ---------- rcp_canary_status into a general register ----------
+
+    #[test]
+    fn test_rcp_canary_status_returns_the_boolean_patterns() {
+        let (mut cpu, mut bus) = rcp_setup();
+        let (hw0, hw1) = encode_mrc2_full(7, 1, 0, 4, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.r[4], RCP_TRUE, "seeded salt reads as true");
+
+        let mut cpu = CortexM33::for_test(0);
+        let mut bus = Bus::default();
+        enable_cp(&mut cpu, 7);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.r[4], RCP_FALSE, "unseeded salt reads as false");
+    }
+
+    /// `mrc p7, #1, APSR_nzcv` is how the bootrom tests the status: the
+    /// true pattern's top nibble 0xa sets N and C, false clears all four.
+    #[test]
+    fn test_rcp_canary_status_pc_form_sets_n_and_c() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.regs.xpsr = (cpu.regs.xpsr & 0x0FFF_FFFF) | 0x5000_0000; // Z, V set
+        let (hw0, hw1) = encode_mrc2_full(7, 1, 0, 15, 0, 0);
+        cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
+        assert_eq!(cpu.regs.xpsr >> 28, 0xA, "NZCV = 1010 when seeded");
     }
 
     // ---------- rcp_count_init / rcp_count_check ----------

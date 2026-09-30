@@ -19518,8 +19518,9 @@ mod stage7_coprocessor_coverage {
     }
 
     #[test]
-    fn cp7_canary_status_non_pc_rt_no_op() {
-        // Rt != 15 → the `(1, 0) if rt == 15` arm doesn't match → silent NOP.
+    fn cp7_canary_status_non_pc_rt_writes_the_pattern() {
+        // Rt != 15 → the status lands in Rt (pico-sdk RCP_MASK_TRUE);
+        // the flags are untouched.
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 7);
         bus.atomics.rcp_salt_set(0, 42);
@@ -19528,6 +19529,7 @@ mod stage7_coprocessor_coverage {
         let hw1: u16 = ((1u16 << 12) | (7u16 << 8)) | 0x10; // Rt=1
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert_eq!(cpu.regs.xpsr, before);
+        assert_eq!(cpu.regs.r[1], 0xa500_a500);
     }
 
     #[test]
@@ -19575,9 +19577,10 @@ mod stage7_coprocessor_coverage {
     fn cp7_mcrr_unknown_opc1_silent_nop() {
         let (mut cpu, mut bus) = make_env();
         enable_cp(&mut cpu, 7);
-        // MCRR2 cp7 opc1=3 (unknown) — silent NOP.
+        // MCRR2 cp7 opc1=15 (unassigned; 0-6 are the rcp.h two-operand
+        // checks, 7 rcp_iequal, 8 the salts) — silent NOP.
         let hw0: u16 = 0xFC40;
-        let hw1: u16 = (7u16 << 8) | (3u16 << 4);
+        let hw1: u16 = (7u16 << 8) | (15u16 << 4);
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
         assert!(cpu.pending_fault.is_none());
     }
