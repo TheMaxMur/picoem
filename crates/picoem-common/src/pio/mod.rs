@@ -373,21 +373,42 @@ impl PioBlock {
     }
 
     /// Advance PIO block by `n` system clocks. Quantum-end variant of
-    /// [`Self::step`]. Initial implementation is a naive loop — preserves all
-    /// cross-cycle state (SM clock divider accumulators, FIFO pressure,
-    /// pin-output merging). A bulk-advance optimisation is future work if
-    /// PIO appears hot in a flamegraph.
+    /// [`Self::step`], with a bulk advance when every enabled SM waits for TX data.
     pub fn step_n(&mut self, n: u32, gpio_in: u32) {
         self.step_n_with_pins(n, gpio_in as u64);
     }
 
     /// Advance PIO block by `n` system clocks with a physical GPIO sample.
     pub fn step_n_with_pins(&mut self, n: u32, gpio_pins: u64) {
-        if self.sm_enabled_mask == 0 {
+        if self.sm_enabled_mask == 0 || n == 0 {
             return;
         }
-        for _ in 0..n {
-            self.step_with_pins(gpio_pins);
+        // Settle newly stalled instructions and pad/side-set writes before skipping.
+        self.step_with_pins(gpio_pins);
+        if n == 1 {
+            return;
+        }
+        // No CPU or DMA can refill a FIFO during this call. Unlike WAIT/IRQ,
+        // an empty PULL cannot be released by another SM in this block.
+        if self
+            .sm
+            .iter()
+            .all(|sm| !sm.enabled || sm.can_skip_pull_stall())
+        {
+            for sm in &mut self.sm {
+                if sm.enabled {
+                    sm.skip_pull_stall(n - 1);
+                }
+            }
+            #[cfg(feature = "pio-pad-diag")]
+            if self.pad_out & (1 << 3) != 0 {
+                self.pad_out_mosi_writes_of_1 =
+                    self.pad_out_mosi_writes_of_1.wrapping_add(u64::from(n - 1));
+            }
+        } else {
+            for _ in 1..n {
+                self.step_with_pins(gpio_pins);
+            }
         }
     }
 
@@ -4048,3 +4069,7 @@ impl PioBlock {
         self.merge_pin_outputs();
     }
 }
+
+#[cfg(test)]
+#[path = "idle_tests.rs"]
+mod idle_tests;

@@ -294,11 +294,7 @@ impl StateMachine {
             return false;
         }
 
-        let threshold = if self.clkdiv_int == 0 {
-            256u32
-        } else {
-            (self.clkdiv_int as u32) * 256 + self.clkdiv_frac as u32
-        };
+        let threshold = self.clock_threshold();
 
         self.clkdiv_acc += 256;
         if self.clkdiv_acc >= threshold {
@@ -306,6 +302,37 @@ impl StateMachine {
             true
         } else {
             false
+        }
+    }
+
+    fn clock_threshold(&self) -> u32 {
+        if self.clkdiv_int == 0 {
+            256
+        } else {
+            u32::from(self.clkdiv_int) * 256 + u32::from(self.clkdiv_frac)
+        }
+    }
+
+    pub(super) fn can_skip_pull_stall(&self) -> bool {
+        self.stalled
+            && matches!(self.stall_kind, StallKind::Pull)
+            && self.tx_fifo.is_empty()
+            && self.delay_count == 0
+            && self.pending_exec.is_none()
+            // A divider write can leave more than one tick's credit. clock_tick
+            // consumes at most one per sysclk, so the quotient is not valid then.
+            && self.clkdiv_acc < self.clock_threshold()
+    }
+
+    pub(super) fn skip_pull_stall(&mut self, cycles: u32) {
+        debug_assert!(self.can_skip_pull_stall());
+        let threshold = u64::from(self.clock_threshold());
+        let clocks = u64::from(self.clkdiv_acc) + u64::from(cycles) * 256;
+        let stalled = clocks / threshold;
+        self.clkdiv_acc = (clocks % threshold) as u32;
+        self.stall_cycles = self.stall_cycles.wrapping_add(stalled);
+        if self.pc == 0x19 {
+            self.cycles_stalled_at_pc_0x19 = self.cycles_stalled_at_pc_0x19.wrapping_add(stalled);
         }
     }
 
