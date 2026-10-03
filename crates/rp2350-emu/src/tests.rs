@@ -28938,7 +28938,7 @@ mod stage3_dma_residue {
     /// Stage 7 semantics: CH0 fires at iteration i=0 and chain-arms
     /// CH15; the same tick's loop continues low-to-high and CH15
     /// fires when iteration reaches i=15 (start-of-tick DREQ snapshot
-    /// + TREQ=63 force = always ready). Both CH0 and CH15 complete in
+    /// and TREQ=63 force = always ready). Both CH0 and CH15 complete in
     /// the same `tick_dma()` call. Pre-Stage-7 the loop `break`'d
     /// after CH0 and CH15 was observed BUSY-but-not-fired between
     /// ticks; the new oracle is "destination has the data after one
@@ -29610,6 +29610,7 @@ mod core_mod_branches {
     ///     transition back to S.
     ///   - In S state, `regs.msp` is the active Secure MSP; `regs.msp_ns`
     ///     holds the banked NS MSP.
+    ///
     /// The same convention applies to PSP/MSPLIM/PSPLIM/CONTROL etc.
     #[test]
     fn sg_from_nonsecure_transitions_and_clears_lr_bit0() {
@@ -30916,7 +30917,7 @@ mod stage4_lib_residue_v2 {
         let after = emu.run(target).unwrap();
         assert!(after >= target);
         // Master cycle count is at least a multiple of step_quantum.
-        assert!(after % (emu.step_quantum as u64) == 0);
+        assert!(after.is_multiple_of(emu.step_quantum as u64));
     }
 
     // ------------------- Cores accessor smoke -------------------
@@ -31416,7 +31417,7 @@ mod stage5_thumb32_corners {
         c.set_reg(3, 0x1234_5678); // accumulator
         // MLA R0, R1, R2, R3: Ra=R3 ≠ 15 → MLA path
         let hw0: u16 = 0xFB01;
-        let hw1: u16 = (3u16 << 12) | (0u16 << 8) | (0u16 << 4) | 2u16;
+        let hw1: u16 = (3u16 << 12) | 2u16;
         c.execute_one_wide(hw0, hw1);
         // product low word = 0; +0x12345678 = 0x12345678
         assert_eq!(c.reg(0), 0x1234_5678);
@@ -33346,8 +33347,9 @@ mod stage8_fpu_helper_sweep {
     #[test]
     fn apply_dn_enabled_passes_through_finite() {
         // DN=1 but result is finite ⇒ passthrough
-        let v = apply_dn_for_test(FPSCR_DN, 3.14_f32);
-        assert_eq!(v, 3.14_f32);
+        let finite = f32::from_bits(0x4048_f5c3);
+        let v = apply_dn_for_test(FPSCR_DN, finite);
+        assert_eq!(v.to_bits(), finite.to_bits());
     }
 
     // -- overflowed: line 169 -------------------------------------------------

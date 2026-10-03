@@ -2411,18 +2411,18 @@ mod tests {
         // (offset 0x020 from PIO0_BASE 0x5020_0000), writes scratch1.
         // No incr (FIFO MMIO + single-word transfer).
         let pio0_rxf0: u32 = 0x5020_0000 + 0x020;
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x00, pio0_rxf0, 0);
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x04, scratch1, 0);
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x08, 1, 0);
+        bus.write32(DMA_BASE, pio0_rxf0, 0);
+        bus.write32(DMA_BASE + 0x04, scratch1, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         let ctrl = make_ctrl(true, 2, false, false, 4, 0, 0, false);
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x0C, ctrl, 0);
+        bus.write32(DMA_BASE + 0x0C, ctrl, 0);
 
         // CH1: paced on DREQ_PIO0_RX0 (same TREQ=4), reads scratch_src,
         // writes scratch2.
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x00, scratch_src, 0);
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x04, scratch2, 0);
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x08, 1, 0);
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x0C, ctrl, 0);
+        bus.write32(DMA_BASE + 0x40, scratch_src, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x04, scratch2, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x0C, ctrl, 0);
 
         // ONE tick — DREQ snapshot taken at tick start should arm both.
         bus.tick_dma();
@@ -2487,12 +2487,12 @@ mod tests {
         // (DMA_BASE + 1*0x40 + 0x00 = 0x5000_0040). No incr; one
         // transfer; paced on DREQ_PIO0_RX0 (TREQ=4).
         let pio0_rxf0: u32 = 0x5020_0000 + 0x020;
-        let ch1_read_addr_reg: u32 = DMA_BASE + 1 * 0x40 + 0x00;
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x00, pio0_rxf0, 0);
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x04, ch1_read_addr_reg, 0);
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x08, 1, 0);
+        let ch1_read_addr_reg: u32 = DMA_BASE + 0x40;
+        bus.write32(DMA_BASE, pio0_rxf0, 0);
+        bus.write32(DMA_BASE + 0x04, ch1_read_addr_reg, 0);
+        bus.write32(DMA_BASE + 0x08, 1, 0);
         let ctrl0 = make_ctrl(true, 2, false, false, 4, 0, 0, false);
-        bus.write32(DMA_BASE + 0 * 0x40 + 0x0C, ctrl0, 0);
+        bus.write32(DMA_BASE + 0x0C, ctrl0, 0);
 
         // CH1: read from a placeholder address, write `scratch`. The
         // placeholder is meaningfully different from
@@ -2501,11 +2501,11 @@ mod tests {
         // original placeholder". Paced on the same DREQ; one transfer.
         let placeholder: u32 = 0x2000_0500;
         bus.write32(placeholder, 0xBAAD_BAAD, 0);
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x00, placeholder, 0);
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x04, scratch, 0);
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x08, 1, 0);
+        bus.write32(DMA_BASE + 0x40, placeholder, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x04, scratch, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x08, 1, 0);
         let ctrl1 = make_ctrl(true, 2, false, false, 4, 0, 0, false);
-        bus.write32(DMA_BASE + 1 * 0x40 + 0x0C, ctrl1, 0);
+        bus.write32(DMA_BASE + 0x40 + 0x0C, ctrl1, 0);
 
         // One tick. CH0 fires first (lowest index), updates
         // CH1.READ_ADDR; CH1 then fires using the just-written value.
