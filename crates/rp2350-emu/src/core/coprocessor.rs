@@ -550,6 +550,19 @@ impl CortexM33 {
     /// and MCRR/MRRC (0xEC/0xFC) encoding families.
     fn cp7_rcp<B: CoreBus>(&mut self, hw0: u16, hw1: u16, bus: &mut B) -> u32 {
         let hw0_high = (hw0 >> 8) & 0xFF;
+        // RP2350 §3.6.3.2: Non-secure reads are zero; writes cannot change
+        // Secure RCP state or raise its data-dependent faults.
+        if !self.secure {
+            if matches!(hw0_high, 0xEE | 0xFE) && hw0 & 0x10 != 0 && hw1 & 0x10 != 0 {
+                let rt = ((hw1 >> 12) & 0xF) as usize;
+                if rt == 15 {
+                    self.regs.xpsr &= 0x0FFF_FFFF;
+                } else {
+                    self.regs.r[rt] = 0;
+                }
+            }
+            return 1;
+        }
         match hw0_high {
             0xEE | 0xFE => self.cp7_mcr_mrc_family(hw0, hw1, bus),
             0xEC | 0xFC => self.cp7_mcrr_mrrc_family(hw0, hw1, bus),
@@ -904,6 +917,83 @@ mod tests {
         cpu.thumb32_coprocessor(hw0, hw1, &mut bus);
 
         assert!(cpu.pending_fault.is_none());
+    }
+
+    #[test]
+    fn nonsecure_rcp_cannot_clobber_a_secure_sequence() {
+        let (mut cpu, mut bus) = rcp_setup();
+        cpu.atomics.rcp_count_set(0, 0x3d);
+        cpu.ppb.nsacr = 1 << 7;
+        cpu.ppb.ns.cpacr = 3 << 14;
+        cpu.transition_to_nonsecure();
+        for instruction in [
+            encode_mcr2_full(7, 4, 6, 0, 0, 0),
+            encode_mcr2_full(7, 5, 6, 0, 1, 0),
+            encode_mcr2_full(7, 5, 6, 0, 1, 0),
+        ] {
+            cpu.thumb32_coprocessor(instruction.0, instruction.1, &mut bus);
+            assert!(
+                cpu.pending_fault.is_none(),
+                "Non-secure count raised a fault"
+            );
+            assert_eq!(
+                cpu.atomics.rcp_count_load(0),
+                0x3d,
+                "Non-secure changed the Secure counter"
+            );
+        }
+        cpu.transition_to_secure();
+        let instruction = encode_mcr2_full(7, 5, 3, 0, 1, 13);
+        cpu.thumb32_coprocessor(instruction.0, instruction.1, &mut bus);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(cpu.atomics.rcp_count_load(0), 0x3e);
+        cpu.thumb32_coprocessor(instruction.0, instruction.1, &mut bus);
+        assert!(
+            matches!(cpu.pending_fault, Some(Fault::Nmi)),
+            "Secure count check was disabled"
+        );
+    }
+
+    #[test]
+    fn nonsecure_rcp_reads_zero_and_writes_do_not_change_either_salt() {
+        let (mut cpu, mut bus) = rcp_setup();
+        let salts = [cpu.atomics.rcp_salt_load(0), cpu.atomics.rcp_salt_load(1)];
+        cpu.ppb.nsacr = 1 << 7;
+        cpu.ppb.ns.cpacr = 3 << 14;
+        cpu.transition_to_nonsecure();
+        for (opc1, opc2) in [(0, 1), (1, 0), (2, 0)] {
+            cpu.regs.r[2] = u32::MAX;
+            let instruction = encode_mrc2_full(7, opc1, 0, 2, opc2, 0);
+            assert_eq!(
+                cpu.thumb32_coprocessor(instruction.0, instruction.1, &mut bus),
+                1
+            );
+            assert_eq!(cpu.regs.r[2], 0, "Non-secure RCP leaked read data");
+        }
+        cpu.regs.xpsr |= 0xf000_0000;
+        let instruction = encode_mrc2_full(7, 1, 0, 15, 0, 0);
+        cpu.thumb32_coprocessor(instruction.0, instruction.1, &mut bus);
+        assert_eq!(cpu.regs.xpsr & 0xf000_0000, 0);
+        for instruction in [
+            encode_mcr2_full(7, 0, 0, 2, 1, 0),
+            encode_mcr2_full(7, 2, 0, 2, 0, 0),
+            encode_mcrr2(7, 7, 3, 2, 0),
+            encode_mcrr2(7, 8, 3, 2, 0),
+            encode_mcrr2(7, 8, 3, 2, 1),
+            encode_cdp2(7, 0, 0, 0, 1, 0),
+        ] {
+            cpu.regs.r[2] = 0x1234;
+            cpu.regs.r[3] = 0x5678;
+            cpu.thumb32_coprocessor(instruction.0, instruction.1, &mut bus);
+            assert!(
+                cpu.pending_fault.is_none(),
+                "Non-secure RCP write raised a fault"
+            );
+            assert_eq!(
+                [cpu.atomics.rcp_salt_load(0), cpu.atomics.rcp_salt_load(1)],
+                salts
+            );
+        }
     }
 
     // ---- CP0 GPIOC tests (Phase 7 Stage C) ----
