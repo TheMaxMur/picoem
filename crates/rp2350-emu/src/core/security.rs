@@ -9,8 +9,11 @@ const SFSR_SFARVALID: u32 = 1 << 6;
 
 impl CortexM33 {
     pub(crate) fn security_fault(&mut self, addr: u32, cause: u32) -> bool {
-        self.ppb.sfsr |= cause | SFSR_SFARVALID;
-        self.ppb.sfar = addr;
+        self.ppb.sfsr |= cause;
+        if cause & SFSR_AUVIOL != 0 {
+            self.ppb.sfsr |= SFSR_SFARVALID;
+            self.ppb.sfar = addr;
+        }
         self.pending_fault = Some(Fault::SecureFault);
         false
     }

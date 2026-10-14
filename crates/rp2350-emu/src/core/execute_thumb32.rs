@@ -1152,6 +1152,9 @@ impl CortexM33 {
         let sysm = (hw1 & 0xFF) as u8;
         let mask = ((hw1 >> 10) & 0x3) as u8;
         let val = self.regs.r[rn];
+        if sysm & 0x80 != 0 && !self.secure {
+            return 1;
+        }
 
         match sysm {
             // APSR — write NZCVQ flags (mask[1] controls NZCVQ group)
@@ -1214,7 +1217,7 @@ impl CortexM33 {
                 self.regs.sync_sp_from_banked();
             }
             // --- Non-Secure banked registers (ARMv8-M, SYSm bit 7 = NS) ---
-            // Accessible from Secure state; we treat everything as Secure.
+            // Only Secure state can name the other bank.
             0x88 => self.regs.msp_ns = val,            // MSP_NS
             0x89 => self.regs.psp_ns = val,            // PSP_NS
             0x8A => self.regs.msplim_ns = val & !0x7,  // MSPLIM_NS
@@ -1237,6 +1240,10 @@ impl CortexM33 {
     fn thumb32_mrs(&mut self, hw1: u16) -> u32 {
         let rd = ((hw1 >> 8) & 0xF) as usize;
         let sysm = (hw1 & 0xFF) as u8;
+        if sysm & 0x80 != 0 && !self.secure {
+            self.regs.r[rd] = 0;
+            return 1;
+        }
 
         self.regs.r[rd] = match sysm {
             // APSR / IAPSR / EAPSR / XPSR / combined variants — NZCVQ flags

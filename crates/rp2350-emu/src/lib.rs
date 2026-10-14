@@ -2668,7 +2668,7 @@ mod stage5_lib_residue {
     /// Secure thread, Non-secure IRQ: the basic frame and the additional
     /// state context (integrity signature, R4-R11) go on the Secure MSP,
     /// the registers are cleared for the Non-secure handler (EXC_RETURN
-    /// 0xFFFF_FFD8: S=1, DCRS=0, ES=0), and the return restores them.
+    /// 0xFFFF_FFF8: S=1, DCRS=1, ES=0), and the return restores them.
     #[test]
     fn ns_irq_from_secure_state_stacks_and_clears_the_callee_registers() {
         let mut emu = emu_two_worlds(true);
@@ -2684,7 +2684,7 @@ mod stage5_lib_residue {
             (c.regs.ipsr(), c.regs.pc(), c.secure),
             (16 + 3, 0x2000_0180, false)
         );
-        assert_eq!(c.regs.lr(), 0xFFFF_FFD8);
+        assert_eq!(c.regs.lr(), 0xFFFF_FFF8);
         assert!(
             c.regs.r[4..12].iter().all(|&r| r == 0),
             "callee registers cleared"

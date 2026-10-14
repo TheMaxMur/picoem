@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{CoreBus, CortexM33, Fault};
 use crate::bus::ppb::{FPCCR_BFRDY, FPCCR_LSPACT, FPCCR_LSPEN, FPCCR_MMRDY, FPCCR_SPLIMVIOL};
@@ -182,7 +182,15 @@ impl CortexM33 {
         );
         self.bus_write32(context_sp.wrapping_add(28), stacked_xpsr, bus);
         if callee_stacked {
-            self.bus_write32(frame_sp, INTEGRITY_SIGNATURE, bus);
+            self.bus_write32(
+                frame_sp,
+                if had_fp {
+                    INTEGRITY_SIGNATURE & !1
+                } else {
+                    INTEGRITY_SIGNATURE
+                },
+                bus,
+            );
             self.bus_write32(frame_sp.wrapping_add(4), 0, bus);
             for i in 0..8 {
                 self.bus_write32(
@@ -241,7 +249,7 @@ impl CortexM33 {
         let mut exc_return = EXC_RETURN_PREFIX;
         for (bit, set) in [
             (EXC_RETURN_S, from_secure),
-            (EXC_RETURN_DCRS, !callee_stacked),
+            (EXC_RETURN_DCRS, true),
             (EXC_RETURN_FTYPE, !had_fp),
             (EXC_RETURN_MODE, !self.regs.in_handler_mode()),
             (EXC_RETURN_SPSEL, use_psp),
@@ -334,7 +342,20 @@ impl CortexM33 {
         self.exclusive_address = None;
 
         let active_exc = self.regs.ipsr(); // capture BEFORE popping
+        if !self.secure && (exc_return & EXC_RETURN_ES != 0 || exc_return & EXC_RETURN_DCRS == 0) {
+            self.security_fault(self.current_instr_addr, 1 << 2); // SFSR.INVER.
+            return 0;
+        }
+        if active_exc == 0
+            || exc_return & EXC_RETURN_PREFIX != EXC_RETURN_PREFIX
+            || exc_return & 2 != 0
+        {
+            self.ppb.cfsr |= UFSR_INVPC;
+            self.pending_fault = Some(Fault::UsageFault);
+            return 0;
+        }
 
+        let handler_secure = self.secure;
         let return_to_psp = exc_return & 0x4 != 0;
         // FType=0 (bit 4 clear) ⇒ FP frame present and must be unwound.
         let had_fp_frame = exc_return & 0x10 == 0;
@@ -394,13 +415,17 @@ impl CortexM33 {
         };
         // Callee registers stacked on entry (DCRS=0): restore them from the
         // additional state context below the basic frame.
-        let callee_stacked = exc_return & EXC_RETURN_DCRS == 0;
+        let callee_stacked =
+            exc_return & EXC_RETURN_DCRS == 0 || (return_secure && !handler_secure);
         if callee_stacked {
-            if self.bus_read32(sp, bus) != INTEGRITY_SIGNATURE {
-                warn!(
-                    sp = format_args!("{sp:#010x}"),
-                    "exception return: bad integrity signature"
-                );
+            let signature = if had_fp_frame {
+                INTEGRITY_SIGNATURE & !1
+            } else {
+                INTEGRITY_SIGNATURE
+            };
+            if self.bus_read32(sp, bus) != signature {
+                self.security_fault(sp, 1 << 1); // SFSR.INVIS, before restoring any registers.
+                return 0;
             }
             for i in 0..8 {
                 self.regs.r[4 + i] = self.bus_read32(sp.wrapping_add(8 + 4 * i as u32), bus);

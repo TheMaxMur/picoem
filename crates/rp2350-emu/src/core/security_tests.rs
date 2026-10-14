@@ -176,3 +176,127 @@ fn rom_hooks_cannot_bypass_secure_fetch_attribution() {
     assert!(!cpu.bootrom_hook_fired);
     assert_eq!(cpu.regs.ipsr(), 7);
 }
+
+fn secure_banks(cpu: &CortexM33) -> [u32; 8] {
+    [
+        cpu.regs.msp_ns,
+        cpu.regs.psp_ns,
+        cpu.regs.msplim_ns,
+        cpu.regs.psplim_ns,
+        cpu.regs.primask_ns,
+        cpu.regs.basepri_ns,
+        cpu.regs.faultmask_ns,
+        cpu.regs.control_ns,
+    ]
+}
+
+#[test]
+fn nonsecure_special_register_aliases_cannot_read_secure_banks() {
+    for sysm in [0x88, 0x89, 0x8a, 0x8b, 0x90, 0x91, 0x93, 0x94] {
+        let (mut cpu, _) = machine(0xbf00);
+        cpu.regs.msp_ns = 0x2000_1234;
+        cpu.regs.psp_ns = 0x2000_5678;
+        cpu.regs.msplim_ns = 0x2000_1000;
+        cpu.regs.psplim_ns = 0x2000_5000;
+        cpu.regs.primask_ns = 1;
+        cpu.regs.basepri_ns = 0x40;
+        cpu.regs.faultmask_ns = 1;
+        cpu.regs.control_ns = 3;
+        cpu.execute_one_wide(0xf3ef, 0x8000 | sysm);
+        assert_eq!(cpu.regs.r[0], 0, "NS MRS alias read S state");
+    }
+}
+
+#[test]
+fn nonsecure_special_register_aliases_cannot_write_secure_banks() {
+    for sysm in [0x88, 0x89, 0x8a, 0x8b, 0x90, 0x91, 0x93, 0x94] {
+        let (mut cpu, _) = machine(0xbf00);
+        let before = secure_banks(&cpu);
+        cpu.regs.r[0] = u32::MAX;
+        cpu.execute_one_wide(0xf380, 0x8800 | sysm);
+        assert_eq!(secure_banks(&cpu), before, "NS MSR alias changed S state");
+    }
+}
+
+fn irq_machine(from_secure: bool) -> (CortexM33, Bus) {
+    let (mut cpu, mut bus) = machine(0x4770); // BX LR.
+    cpu.ppb.nvic_itns[0] = 1 << 3;
+    cpu.ppb.ns.vtor = NS_DATA;
+    bus.write32(NS_DATA + 19 * 4, NS_CODE | 1, 0);
+    if from_secure {
+        cpu.transition_to_secure();
+        cpu.regs.set_pc(SECRET);
+    }
+    cpu.regs.r[4] = 0xdead_beef;
+    cpu.enter_exception(19, &mut bus);
+    (cpu, bus)
+}
+
+#[test]
+fn forged_exception_return_cannot_elevate_a_nonsecure_handler() {
+    let (mut cpu, mut bus) = irq_machine(false);
+    let s_sp = cpu.regs.msp_ns;
+    bus.write32(s_sp, 0x1234_5678, 0);
+    bus.write32(s_sp + 24, SECRET | 1, 0);
+    bus.write32(s_sp + 28, 0x0100_0000, 0);
+    cpu.regs.set_lr(cpu.regs.lr() | (1 << 6) | 1);
+    cpu.step(&mut bus);
+    assert_ne!(cpu.ppb.sfsr & (1 << 2), 0, "forged EXC_RETURN elevated NS");
+    assert_ne!(
+        cpu.regs.r[0], 0x1234_5678,
+        "S frame was exported before refusal"
+    );
+    assert_eq!(cpu.regs.ipsr(), 7);
+}
+
+#[test]
+fn an_exception_return_in_thread_mode_cannot_pop_a_secure_frame() {
+    let (mut cpu, mut bus) = machine(0x4770);
+    let s_sp = cpu.regs.msp_ns;
+    bus.write32(s_sp, 0x1234_5678, 0);
+    bus.write32(s_sp + 24, SECRET | 1, 0);
+    bus.write32(s_sp + 28, 0x0100_0000, 0);
+    cpu.regs.set_lr(0xffff_fff8);
+    cpu.step(&mut bus);
+    assert_ne!(cpu.regs.r[0], 0x1234_5678);
+    assert_eq!(cpu.regs.ipsr(), 3);
+}
+
+#[test]
+fn a_secure_context_can_return_from_its_nonsecure_interrupt() {
+    let (mut cpu, mut bus) = irq_machine(true);
+    assert!(!cpu.secure);
+    assert_eq!(cpu.regs.r[4], 0);
+    assert_ne!(
+        cpu.regs.lr() & (1 << 5),
+        0,
+        "DCRS must retain the default rules"
+    );
+    cpu.step(&mut bus);
+    assert!(cpu.secure);
+    assert_eq!(cpu.regs.ipsr(), 0);
+    assert_eq!(cpu.regs.r[4], 0xdead_beef);
+    assert_eq!(cpu.regs.pc(), SECRET);
+}
+
+#[test]
+fn a_nonsecure_context_can_return_from_its_nonsecure_interrupt() {
+    let (mut cpu, mut bus) = irq_machine(false);
+    cpu.step(&mut bus);
+    assert!(!cpu.secure);
+    assert_eq!(cpu.regs.ipsr(), 0);
+    assert_eq!(cpu.regs.r[4], 0xdead_beef);
+}
+
+#[test]
+fn corrupted_secure_integrity_signature_prevents_register_restore() {
+    let (mut cpu, mut bus) = irq_machine(true);
+    bus.write32(cpu.regs.msp_ns, 0, 0);
+    cpu.step(&mut bus);
+    assert_ne!(cpu.ppb.sfsr & (1 << 1), 0, "bad signature was accepted");
+    assert_eq!(
+        cpu.regs.r[4], 0,
+        "S callee registers were restored before refusal"
+    );
+    assert_eq!(cpu.regs.ipsr(), 7);
+}
