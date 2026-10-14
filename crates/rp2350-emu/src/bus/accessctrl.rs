@@ -173,6 +173,14 @@ impl AccessCtrl {
         }
     }
 
+    pub fn nonsecure_dreq_permitted(&self, addr: u32, privileged: bool) -> bool {
+        let Some(offset) = target_register(addr) else {
+            return false;
+        };
+        let permissions = self.registers[(offset / 4) as usize];
+        permissions & 2 != 0 && (privileged || permissions & 1 != 0)
+    }
+
     pub fn permitted(&self, addr: u32, access: Access) -> bool {
         let access = self.effective(access);
         if addr >> 28 == 0xd {

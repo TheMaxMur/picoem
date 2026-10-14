@@ -493,3 +493,34 @@ fn serial_high_gpio_outputs_drive_pins_before_nonsecure_input_filtering() {
     emu.bus.write32(0x4006_0010, 15, 0);
     assert_eq!(cpu.bus_read32(0xd000_0008, &mut emu.bus), 4);
 }
+
+#[test]
+fn nonsecure_dma_controller_grant_does_not_expose_secure_channel_registers() {
+    let (mut cpu, mut bus) = machine(0x6808);
+    bus.write32(0x4002_3000, 1 << crate::bus::RESET_DMA, 0);
+    bus.write32(0x5000_0000, SECRET, 0);
+    bus.write32(0x4006_0044, 0xacce_00ff, 0);
+    cpu.regs.r[1] = 0x5000_0000;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.r[0], 0, "NS saw Secure DMA channel pointers");
+    assert_eq!(cpu.regs.ipsr(), 3);
+}
+
+#[test]
+fn nonsecure_dma_narrow_stores_cannot_change_secure_channel_addresses() {
+    for op in [0x7008, 0x8008, 0x6008] {
+        let (mut cpu, mut bus) = machine(op);
+        bus.write32(0x4002_3000, 1 << crate::bus::RESET_DMA, 0);
+        bus.write32(0x5000_0000, SECRET, 0);
+        bus.write32(0x4006_0044, 0xacce_00ff, 0);
+        cpu.regs.r[1] = 0x5000_0000;
+        cpu.regs.r[0] = NS_DATA;
+        cpu.step(&mut bus);
+        assert_eq!(
+            bus.read32(0x5000_0000, 0),
+            SECRET,
+            "NS changed an S DMA pointer"
+        );
+        assert_eq!(cpu.regs.ipsr(), 3);
+    }
+}

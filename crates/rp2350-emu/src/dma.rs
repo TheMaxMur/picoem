@@ -38,6 +38,9 @@
 //! data phases, but no corpus scenario distinguishes.
 
 use crate::bus::Bus;
+use crate::bus::accessctrl::Access;
+
+mod security;
 use crate::dreq::{DREQ_FORCE, DREQ_TIMER0, DREQ_TIMER3};
 use crate::irq::{IRQ_DMA_IRQ_0, IRQ_DMA_IRQ_1, IRQ_DMA_IRQ_2, IRQ_DMA_IRQ_3};
 
@@ -298,6 +301,7 @@ pub struct ChannelTransferEvent {
 
 /// DMA controller state — 16 channels + global registers.
 pub struct Dma {
+    security: security::Security,
     channels: [DmaChannel; NUM_CHANNELS],
     /// Raw interrupt status. Bit N latches when channel N's
     /// `trans_count` hits 0 (or via `INTF` force). Low 16 bits used.
@@ -355,6 +359,7 @@ impl Dma {
     /// Construct a DMA controller at power-on defaults.
     pub fn new() -> Self {
         Self {
+            security: security::Security::default(),
             channels: [DmaChannel::default(); NUM_CHANNELS],
             intr: 0,
             inte0: 0,
@@ -465,6 +470,111 @@ impl Dma {
     /// the live `channel.busy` flag — firmware polls this to determine
     /// when a transfer has completed.
     pub fn read32(&self, offset: u32) -> u32 {
+        self.read32_as(offset, Access::debugger()).unwrap_or(0)
+    }
+
+    pub(crate) fn read32_as(&self, offset: u32, access: Access) -> Result<u32, ()> {
+        if let Some(value) = self.security.read(offset, access)? {
+            return Ok(value);
+        }
+        let level = security::level(access);
+        if level < self.security.required(offset) {
+            return Err(());
+        }
+        let value = self.read32_inner(offset);
+        Ok(if offset == REG_INTR {
+            value & self.security.channel_mask(level)
+        } else if let Some(irq) = Self::irq_for_offset(offset) {
+            value & self.security.channel_mask(self.security.irq_level(irq))
+        } else {
+            value
+        })
+    }
+
+    pub(crate) fn write_masked(
+        &mut self,
+        offset: u32,
+        value: u32,
+        mask: u32,
+        alias: u32,
+        access: Access,
+    ) -> Result<(), ()> {
+        let w1c = matches!(
+            offset,
+            REG_INTR | REG_INTS0 | REG_INTS1 | REG_INTS2 | REG_INTS3
+        );
+        let mut payload = if alias == 0 && !w1c {
+            (self.read32_as(offset, access)? & !mask) | (value & mask)
+        } else {
+            value & mask
+        };
+        if offset < 0x400
+            && matches!(
+                offset % 0x40,
+                CH_CTRL_TRIG | CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL
+            )
+        {
+            payload &= !((CTRL_READ_ERROR | CTRL_WRITE_ERROR) & !mask);
+        }
+        self.write32_as(offset, payload, alias, access)
+    }
+
+    fn irq_for_offset(offset: u32) -> Option<usize> {
+        match offset {
+            0x404..=0x40c => Some(0),
+            0x414..=0x41c => Some(1),
+            0x424..=0x42c => Some(2),
+            0x434..=0x43c => Some(3),
+            _ => None,
+        }
+    }
+
+    pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
+        let _ = self.write32_as(offset, value, alias, Access::debugger());
+    }
+
+    pub(crate) fn write32_as(
+        &mut self,
+        offset: u32,
+        value: u32,
+        alias: u32,
+        access: Access,
+    ) -> Result<(), ()> {
+        if self.security.write(offset, value, alias, access)? {
+            return Ok(());
+        }
+        let level = security::level(access);
+        if level < self.security.required(offset) {
+            return Err(());
+        }
+        if offset < 0x400 {
+            self.security.lock_channel((offset / 0x40) as usize);
+        }
+        if offset == REG_INTR {
+            self.intr &=
+                !(apply_alias(self.intr, value, alias) & self.security.channel_mask(level));
+        } else if let Some(irq) = Self::irq_for_offset(offset) {
+            let mask = self.security.channel_mask(self.security.irq_level(irq));
+            if offset & 0xf == 0xc {
+                self.write32_inner(offset, value & mask, alias);
+            } else {
+                let old = self.read32_inner(offset);
+                let new = (old & !mask) | (apply_alias(old, value, alias) & mask);
+                self.write32_inner(offset, new, 0);
+            }
+        } else if matches!(offset, REG_MULTI_CHAN_TRIGGER | REG_CHAN_ABORT) {
+            self.write32_inner(
+                offset,
+                apply_alias(0, value, alias) & self.security.channel_mask(level),
+                0,
+            );
+        } else {
+            self.write32_inner(offset, value, alias);
+        }
+        Ok(())
+    }
+
+    fn read32_inner(&self, offset: u32) -> u32 {
         if offset < (NUM_CHANNELS as u32) * 0x40 {
             let ch_idx = (offset / 0x40) as usize;
             let inner = offset % 0x40;
@@ -520,7 +630,7 @@ impl Dma {
     }
 
     /// Write a DMA register.
-    pub fn write32(&mut self, offset: u32, value: u32, alias: u32) {
+    fn write32_inner(&mut self, offset: u32, value: u32, alias: u32) {
         if offset < (NUM_CHANNELS as u32) * 0x40 {
             let ch_idx = (offset / 0x40) as usize;
             let inner = offset % 0x40;
@@ -608,7 +718,13 @@ impl Dma {
 
     fn channel_read32(&self, ch_idx: usize, inner: u32) -> u32 {
         let ch = &self.channels[ch_idx];
-        let ctrl_image = (ch.ctrl & !CTRL_BUSY) | (if ch.busy { CTRL_BUSY } else { 0 });
+        let ctrl_image = (ch.ctrl & !CTRL_BUSY)
+            | (if ch.busy { CTRL_BUSY } else { 0 })
+            | if ch.ctrl & (CTRL_READ_ERROR | CTRL_WRITE_ERROR) != 0 {
+                CTRL_AHB_ERROR
+            } else {
+                0
+            };
         match inner {
             CH_READ_ADDR | CH_AL1_READ_ADDR | CH_AL2_READ_ADDR | CH_AL3_READ_ADDR_TRIG => {
                 ch.read_addr
@@ -657,13 +773,17 @@ impl Dma {
             }
             CH_CTRL_TRIG => {
                 let new = apply_alias(self.channels[ch_idx].ctrl, value, alias);
-                self.channels[ch_idx].ctrl = new & CTRL_WRITABLE_MASK;
+                let errors =
+                    self.channels[ch_idx].ctrl & (CTRL_READ_ERROR | CTRL_WRITE_ERROR) & !value;
+                self.channels[ch_idx].ctrl = (new & CTRL_WRITABLE_MASK) | errors;
                 self.check_inert_ctrl_bits(ch_idx, new);
                 self.trigger_channel(ch_idx);
             }
             CH_AL1_CTRL | CH_AL2_CTRL | CH_AL3_CTRL => {
                 let new = apply_alias(self.channels[ch_idx].ctrl, value, alias);
-                self.channels[ch_idx].ctrl = new & CTRL_WRITABLE_MASK;
+                let errors =
+                    self.channels[ch_idx].ctrl & (CTRL_READ_ERROR | CTRL_WRITE_ERROR) & !value;
+                self.channels[ch_idx].ctrl = (new & CTRL_WRITABLE_MASK) | errors;
                 self.check_inert_ctrl_bits(ch_idx, new);
             }
             _ => {}
@@ -696,6 +816,10 @@ impl Dma {
     /// Arm a channel: if `CTRL.EN` is set and `TRANS_COUNT > 0`, mark
     /// `BUSY`. Otherwise no-op.
     fn trigger_channel(&mut self, ch_idx: usize) {
+        if self.channels[ch_idx].ctrl & (CTRL_READ_ERROR | CTRL_WRITE_ERROR) != 0 {
+            return;
+        }
+
         let ch = &mut self.channels[ch_idx];
         if (ch.ctrl & CTRL_EN) == 0 {
             return;
@@ -780,10 +904,47 @@ impl Dma {
                 || ((DREQ_TIMER0..=DREQ_TIMER3).contains(&treq)
                     && self.timer_dreq_asserted[(treq - DREQ_TIMER0) as usize])
                 || (treq < 64 && (dreqs >> treq) & 1 != 0);
-            if ready {
+            if ready && self.dreq_visible(treq, i, bus) {
                 self.issue_transfer(i, bus);
             }
         }
+    }
+
+    fn dreq_visible(&self, treq: u8, channel: usize, bus: &Bus) -> bool {
+        if treq == DREQ_FORCE {
+            return true;
+        }
+        if (DREQ_TIMER0..=DREQ_TIMER3).contains(&treq) {
+            return self.security.channel_level(channel)
+                >= self.security.timer_level((treq - DREQ_TIMER0) as usize);
+        }
+        let access = self.security.channel_access(channel);
+        if access.secure {
+            return true;
+        }
+        let address = match treq {
+            0..=7 => 0x5020_0000,
+            8..=15 => 0x5030_0000,
+            16..=23 => 0x5040_0000,
+            24..=25 => 0x4008_0000,
+            26..=27 => 0x4008_8000,
+            28..=29 => 0x4007_0000,
+            30..=31 => 0x4007_8000,
+            32..=43 => 0x400a_8000,
+            44..=45 => 0x4009_0000,
+            46..=47 => 0x4009_8000,
+            48 => 0x400a_0000,
+            49 => 0x5050_0000,
+            50..=51 => 0x400d_0000,
+            52 => 0x5060_0000,
+            53 => 0x5070_0000,
+            54 => 0x400f_8000,
+            _ => return false,
+        };
+        bus.accessctrl
+            .lock()
+            .unwrap()
+            .nonsecure_dreq_permitted(address, access.privileged)
     }
 
     fn issue_transfer(&mut self, ch_idx: usize, bus: &mut Bus) {
@@ -810,8 +971,38 @@ impl Dma {
         // Real silicon's AHB carries DMA self-accesses to the DMA
         // peripheral the same as any other master would; this branch
         // emulates that.
-        let value = self.dma_routed_read(read_addr, size, bus);
-        self.dma_routed_write(write_addr, value, size, bus);
+        let access = self.security.channel_access(ch_idx);
+        for (addr, error) in [(read_addr, CTRL_READ_ERROR), (write_addr, CTRL_WRITE_ERROR)] {
+            if !self.transfer_allowed(addr, size, ch_idx, bus) {
+                self.fail_channel(ch_idx, error);
+                return;
+            }
+        }
+        let old_context = {
+            let mut ctrl = bus.accessctrl.lock().unwrap();
+            let old = ctrl.contexts[0];
+            ctrl.contexts[0] = access;
+            old
+        };
+        let old_fault = bus.bus_fault(0);
+        let old_address = bus.bus_fault_addr(0);
+        bus.clear_bus_fault(0);
+        let read = self.dma_routed_read(read_addr, size, bus, access);
+        let error = if read.is_err() || bus.bus_fault(0) {
+            Some(CTRL_READ_ERROR)
+        } else {
+            let written = self.dma_routed_write(write_addr, read.unwrap_or(0), size, bus, access);
+            (written.is_err() || bus.bus_fault(0)).then_some(CTRL_WRITE_ERROR)
+        };
+        bus.accessctrl.lock().unwrap().contexts[0] = old_context;
+        bus.clear_bus_fault(0);
+        if old_fault {
+            bus.atomics.set_bus_fault(0, old_address);
+        }
+        if let Some(error) = error {
+            self.fail_channel(ch_idx, error);
+            return;
+        }
 
         // Test-only push-event observable. Recorded inside
         // `issue_transfer` synchronously with the bus write that
@@ -856,7 +1047,10 @@ impl Dma {
                 self.intr |= 1u32 << ch_idx;
             }
             let chain_to = ch.chain_to() as usize;
-            if chain_to != ch_idx && chain_to < NUM_CHANNELS {
+            if chain_to != ch_idx
+                && chain_to < NUM_CHANNELS
+                && self.security.channel_level(ch_idx) >= self.security.channel_level(chain_to)
+            {
                 let reload = self.channels[chain_to].trans_count_reload;
                 if reload > 0 {
                     self.channels[chain_to].trans_count = reload;
@@ -864,6 +1058,28 @@ impl Dma {
                 self.trigger_channel(chain_to);
             }
         }
+    }
+
+    fn fail_channel(&mut self, channel: usize, error: u32) {
+        self.channels[channel].busy = false;
+        self.channels[channel].ctrl |= error;
+        self.intr |= 1 << channel;
+    }
+
+    fn transfer_allowed(&self, addr: u32, size: u32, channel: usize, bus: &Bus) -> bool {
+        if matches!(addr >> 28, 0xd | 0xe) || !self.security.transfer_allowed(addr, size, channel) {
+            return false;
+        }
+        let Some(end) = addr.checked_add(size - 1) else {
+            return false;
+        };
+        let access = self.security.channel_access(channel);
+        let ctrl = bus.accessctrl.lock().unwrap();
+        if !ctrl.permitted(addr, access) || !ctrl.permitted(end, access) {
+            return false;
+        }
+        !Self::is_dma_aperture(addr)
+            || security::level(access) >= self.security.required(addr & 0xfff)
     }
 
     /// True iff `addr` falls in the DMA register aperture decoded by
@@ -879,25 +1095,31 @@ impl Dma {
     /// through `self` so a self-read observes the live DMA state, not
     /// the empty stand-in left by `Bus::tick_dma`'s `mem::take`.
     #[inline]
-    fn dma_routed_read(&self, addr: u32, size: u32, bus: &mut Bus) -> u32 {
+    fn dma_routed_read(
+        &self,
+        addr: u32,
+        size: u32,
+        bus: &mut Bus,
+        access: Access,
+    ) -> Result<u32, ()> {
         if Self::is_dma_aperture(addr) {
             // DMA registers are 32-bit; sub-word reads pick the bytes
             // out of the underlying word the same way `Bus::read8/16`
             // do for word-only peripherals (LE byte select).
             let canonical = addr & !0x3000;
             let word_offset = canonical & 0x0000_0FFC;
-            let word = self.read32(word_offset);
-            match size {
+            let word = self.read32_as(word_offset, access)?;
+            Ok(match size {
                 1 => (word >> ((addr & 3) * 8)) & 0xFF,
                 2 => (word >> ((addr & 2) * 8)) & 0xFFFF,
                 _ => word,
-            }
+            })
         } else {
-            match size {
+            Ok(match size {
                 1 => bus.read8(addr, 0) as u32,
                 2 => bus.read16(addr, 0) as u32,
                 _ => bus.read32(addr, 0),
-            }
+            })
         }
     }
 
@@ -908,21 +1130,24 @@ impl Dma {
     /// concerns (LR/SC reservation invalidation, MMIO trace) that
     /// `Bus::write*` would have applied on the silicon path.
     #[inline]
-    fn dma_routed_write(&mut self, addr: u32, value: u32, size: u32, bus: &mut Bus) {
+    fn dma_routed_write(
+        &mut self,
+        addr: u32,
+        value: u32,
+        size: u32,
+        bus: &mut Bus,
+        access: Access,
+    ) -> Result<(), ()> {
         if Self::is_dma_aperture(addr) {
-            // V1 DMA-to-DMA writes are word-only — every channel
-            // register is 32-bit and sub-word access on real silicon
-            // is unspecified for AHB-Lite slaves. If a corpus ever
-            // exercises narrow self-writes, expand here with the
-            // matching RMW path the peripheral bus uses.
-            debug_assert_eq!(
-                size, 4,
-                "DMA-to-DMA narrow transfer not modelled (size={size}, addr=0x{addr:08X})"
-            );
-            let canonical = addr & !0x3000;
-            let offset = canonical & 0x0000_0FFF;
+            let offset = addr & 0xffc;
             let alias = (addr >> 12) & 3;
-            self.write32(offset, value, alias);
+            if size == 4 {
+                self.write32_as(offset, value, alias, access)?;
+            } else {
+                let shift = (addr & if size == 1 { 3 } else { 2 }) * 8;
+                let mask = if size == 1 { 0xff } else { 0xffff };
+                self.write_masked(offset, value << shift, mask << shift, alias, access)?;
+            }
             // Mirror the cross-cutting work `Bus::write32` would have
             // done before reaching the DMA aperture dispatch.
             bus.invalidate_reservation_at(addr);
@@ -936,23 +1161,40 @@ impl Dma {
                 _ => bus.write32(addr, value, 0),
             }
         }
+        Ok(())
     }
 
     /// OR DMA IRQ lines into the shared `CoreAtomics` wire. Call this
     /// after [`Self::tick`] so both cores' NVICs latch any just-completed
     /// transfer. Phase 3 Stage 1 migrated the storage off `Bus`.
     pub fn route_irqs(&self, atomics: &crate::threaded::CoreAtomics) {
-        if (self.intr | self.intf0) & self.inte0 != 0 {
+        if (self.intr | self.intf0)
+            & self.inte0
+            & self.security.channel_mask(self.security.irq_level(0))
+            != 0
+        {
             // DMA IRQs are shared — both cores see them.
             atomics.assert_irq_shared(IRQ_DMA_IRQ_0);
         }
-        if (self.intr | self.intf1) & self.inte1 != 0 {
+        if (self.intr | self.intf1)
+            & self.inte1
+            & self.security.channel_mask(self.security.irq_level(1))
+            != 0
+        {
             atomics.assert_irq_shared(IRQ_DMA_IRQ_1);
         }
-        if (self.intr | self.intf2) & self.inte2 != 0 {
+        if (self.intr | self.intf2)
+            & self.inte2
+            & self.security.channel_mask(self.security.irq_level(2))
+            != 0
+        {
             atomics.assert_irq_shared(IRQ_DMA_IRQ_2);
         }
-        if (self.intr | self.intf3) & self.inte3 != 0 {
+        if (self.intr | self.intf3)
+            & self.inte3
+            & self.security.channel_mask(self.security.irq_level(3))
+            != 0
+        {
             atomics.assert_irq_shared(IRQ_DMA_IRQ_3);
         }
     }
@@ -2618,3 +2860,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "dma/security_tests.rs"]
+mod security_tests;

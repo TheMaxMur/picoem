@@ -1712,6 +1712,10 @@ impl Bus {
     // --- 8-bit access ---
 
     pub fn read8(&mut self, addr: u32, core: u8) -> u8 {
+        if addr.wrapping_sub(DMA_BASE) < 0x4000 {
+            return (self.dma_read32(addr & 0xffc, core) >> ((addr & 3) * 8)) as u8;
+        }
+
         if accessctrl::AccessCtrl::owns(addr) {
             return (self.accessctrl.lock().unwrap().read(addr) >> ((addr & 3) * 8)) as u8;
         }
@@ -1912,6 +1916,25 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        if addr.wrapping_sub(DMA_BASE) < 0x4000 {
+            let access = self.accessctrl.lock().unwrap().contexts[core as usize];
+            let shift = (addr & 3) * 8;
+            if self
+                .dma
+                .write_masked(
+                    addr & 0xffc,
+                    u32::from(val) << shift,
+                    0xff << shift,
+                    (addr >> 12) & 3,
+                    access,
+                )
+                .is_err()
+            {
+                self.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
+
         if accessctrl::AccessCtrl::owns(addr) {
             let mut policy = self.accessctrl.lock().unwrap();
             let access = policy.contexts[core as usize];
@@ -2497,6 +2520,10 @@ impl Bus {
     // --- 16-bit access ---
 
     pub fn read16(&mut self, addr: u32, core: u8) -> u16 {
+        if addr.wrapping_sub(DMA_BASE) < 0x4000 {
+            return (self.dma_read32(addr & 0xffc, core) >> ((addr & 2) * 8)) as u16;
+        }
+
         if accessctrl::AccessCtrl::owns(addr) {
             return (self.accessctrl.lock().unwrap().read(addr) >> ((addr & 2) * 8)) as u16;
         }
@@ -2707,6 +2734,25 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        if addr.wrapping_sub(DMA_BASE) < 0x4000 {
+            let access = self.accessctrl.lock().unwrap().contexts[core as usize];
+            let shift = (addr & 2) * 8;
+            if self
+                .dma
+                .write_masked(
+                    addr & 0xffc,
+                    u32::from(val) << shift,
+                    0xffff << shift,
+                    (addr >> 12) & 3,
+                    access,
+                )
+                .is_err()
+            {
+                self.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
+
         if accessctrl::AccessCtrl::owns(addr) {
             let mut policy = self.accessctrl.lock().unwrap();
             let access = policy.contexts[core as usize];
@@ -3296,7 +3342,7 @@ impl Bus {
                         PWM_BASE => self.pwm.read32(offset),
                         IO_BANK0_BASE => self.io_bank0.read32(offset),
                         PADS_BANK0_BASE => self.pads_bank0.read32(offset),
-                        DMA_BASE => self.dma.read32(offset),
+                        DMA_BASE => self.dma_read32(offset, core),
                         SYSCFG_BASE => self.syscfg.read32(offset),
                         TBMAN_BASE => self.tbman.read32(offset),
                         GLITCH_DETECTOR_BASE => self.glitch.read32(offset),
@@ -3498,7 +3544,7 @@ impl Bus {
                         }
                         IO_BANK0_BASE => self.io_bank0.write32(offset, val, alias),
                         PADS_BANK0_BASE => self.pads_bank0.write32(offset, val, alias),
-                        DMA_BASE => self.dma.write32(offset, val, alias),
+                        DMA_BASE => self.dma_write32(offset, val, alias, core),
                         SYSCFG_BASE => self.syscfg.write32(offset, val, alias),
                         TBMAN_BASE => self.tbman.write32(offset, val, alias),
                         GLITCH_DETECTOR_BASE => self.glitch.write32(offset, val, alias),
@@ -3686,6 +3732,26 @@ impl Bus {
     ///
     /// Per HLD V5 §5.6 ordering contract: peripherals tick first (to
     /// produce DREQ), then `tick_dma` consumes the snapshot.
+    fn dma_read32(&self, offset: u32, core: u8) -> u32 {
+        let access = self.accessctrl.lock().unwrap().contexts[core as usize];
+        match self.dma.read32_as(offset, access) {
+            Ok(value) => value,
+            Err(()) => {
+                self.atomics
+                    .set_bus_fault(core as usize, crate::dma::DMA_BASE + offset);
+                0
+            }
+        }
+    }
+
+    fn dma_write32(&mut self, offset: u32, value: u32, alias: u32, core: u8) {
+        let access = self.accessctrl.lock().unwrap().contexts[core as usize];
+        if self.dma.write32_as(offset, value, alias, access).is_err() {
+            self.atomics
+                .set_bus_fault(core as usize, crate::dma::DMA_BASE + offset);
+        }
+    }
+
     pub fn tick_dma(&mut self) {
         let mut dma = std::mem::take(&mut self.dma);
         dma.tick(self);

@@ -461,19 +461,29 @@ impl WorkerBus {
     }
 
     /// AHB (`0x5`) read32 — DMA at 0x5000_0000, PIO at 0x5020_0000..0x5040_0000.
-    fn ahb_read32(&mut self, addr: u32) -> u32 {
+    fn ahb_read32(&mut self, addr: u32, core: u8) -> u32 {
         let canonical = addr & !0x3000;
         let base = canonical & 0xFFFF_F000;
         let offset = canonical & 0x0000_0FFF;
         match base {
-            DMA_BASE => self
-                .shared
-                .peripherals
-                .dma
-                .lock()
-                .unwrap()
-                .dma
-                .read32(offset),
+            DMA_BASE => {
+                let access = self.shared.accessctrl.lock().unwrap().contexts[core as usize];
+                match self
+                    .shared
+                    .peripherals
+                    .dma
+                    .lock()
+                    .unwrap()
+                    .dma
+                    .read32_as(offset, access)
+                {
+                    Ok(value) => value,
+                    Err(()) => {
+                        self.shared.atomics.set_bus_fault(core as usize, addr);
+                        0
+                    }
+                }
+            }
             // USBCTRL regs + DPRAM (HLD V5 §Component 1). RESETS guard
             // mirrors the serial Bus: held peripherals read as 0
             // (`bus/mod.rs:1656`, `2332`).
@@ -567,20 +577,27 @@ impl WorkerBus {
     /// command onto `shared.pio` for Stage 7's worker to apply
     /// (Stage 5 stubs PIO writes to a no-op because `ThreadedPio`
     /// command encoding is Stage 7's domain).
-    fn ahb_write32(&mut self, addr: u32, val: u32) {
+    fn ahb_write32(&mut self, addr: u32, val: u32, core: u8) {
         let canonical = addr & !0x3000;
         let base = canonical & 0xFFFF_F000;
         let offset = canonical & 0x0000_0FFF;
         let alias = (addr >> 12) & 3;
         match base {
-            DMA_BASE => self
-                .shared
-                .peripherals
-                .dma
-                .lock()
-                .unwrap()
-                .dma
-                .write32(offset, val, alias),
+            DMA_BASE => {
+                let access = self.shared.accessctrl.lock().unwrap().contexts[core as usize];
+                if self
+                    .shared
+                    .peripherals
+                    .dma
+                    .lock()
+                    .unwrap()
+                    .dma
+                    .write32_as(offset, val, alias, access)
+                    .is_err()
+                {
+                    self.shared.atomics.set_bus_fault(core as usize, addr);
+                }
+            }
             // USBCTRL regs + DPRAM (HLD V5 §Component 1). RESETS guard
             // mirrors the serial Bus: held peripherals drop writes
             // silently (`bus/mod.rs:2730`, `2872`).
@@ -1237,7 +1254,7 @@ impl CoreBus for WorkerBus {
                     return v;
                 }
                 let word = if (addr >> 28) == 0x5 {
-                    self.ahb_read32(addr & !3)
+                    self.ahb_read32(addr & !3, core)
                 } else {
                     self.apb_read32(addr & !3)
                 };
@@ -1274,7 +1291,7 @@ impl CoreBus for WorkerBus {
                     return v;
                 }
                 let word = if (addr >> 28) == 0x5 {
-                    self.ahb_read32(addr & !3)
+                    self.ahb_read32(addr & !3, core)
                 } else {
                     self.apb_read32(addr & !3)
                 };
@@ -1306,7 +1323,7 @@ impl CoreBus for WorkerBus {
         match addr >> 28 {
             0x0..=0x2 => self.shared.memory.read32(addr),
             0x4 => self.apb_read32(addr),
-            0x5 => self.ahb_read32(addr),
+            0x5 => self.ahb_read32(addr, core),
             0xD => self.sio_read32(addr, core),
             _ => {
                 self.shared.atomics.set_bus_fault(core as usize, addr);
@@ -1319,6 +1336,30 @@ impl CoreBus for WorkerBus {
     /// `shared.memory.cas32` + `shared.monitors.snoop` directly per
     /// LLD V7 §4.
     fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        if addr.wrapping_sub(DMA_BASE) < 0x4000 {
+            let access = self.shared.accessctrl.lock().unwrap().contexts[core as usize];
+            let shift = (addr & 3) * 8;
+            if self
+                .shared
+                .peripherals
+                .dma
+                .lock()
+                .unwrap()
+                .dma
+                .write_masked(
+                    addr & 0xffc,
+                    u32::from(val) << shift,
+                    0xff << shift,
+                    (addr >> 12) & 3,
+                    access,
+                )
+                .is_err()
+            {
+                self.shared.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
+
         if crate::bus::accessctrl::AccessCtrl::owns(addr) {
             let mut policy = self.shared.accessctrl.lock().unwrap();
             let access = policy.contexts[core as usize];
@@ -1365,11 +1406,11 @@ impl CoreBus for WorkerBus {
             }
             0x5 => {
                 let aligned = addr & !3;
-                let word = self.ahb_read32(aligned);
+                let word = self.ahb_read32(aligned, core);
                 let shift = (addr & 3) * 8;
                 let masked = word & !(0xFFu32 << shift);
                 let new_word = masked | ((val as u32) << shift);
-                self.ahb_write32(aligned, new_word);
+                self.ahb_write32(aligned, new_word, core);
             }
             0xD => {
                 // SIO GPIO_OUT family (0x010/0x018/0x020/0x028) and
@@ -1403,6 +1444,30 @@ impl CoreBus for WorkerBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        if addr.wrapping_sub(DMA_BASE) < 0x4000 {
+            let access = self.shared.accessctrl.lock().unwrap().contexts[core as usize];
+            let shift = (addr & 2) * 8;
+            if self
+                .shared
+                .peripherals
+                .dma
+                .lock()
+                .unwrap()
+                .dma
+                .write_masked(
+                    addr & 0xffc,
+                    u32::from(val) << shift,
+                    0xffff << shift,
+                    (addr >> 12) & 3,
+                    access,
+                )
+                .is_err()
+            {
+                self.shared.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
+
         if crate::bus::accessctrl::AccessCtrl::owns(addr) {
             let mut policy = self.shared.accessctrl.lock().unwrap();
             let access = policy.contexts[core as usize];
@@ -1443,11 +1508,11 @@ impl CoreBus for WorkerBus {
             }
             0x5 => {
                 let aligned = addr & !3;
-                let word = self.ahb_read32(aligned);
+                let word = self.ahb_read32(aligned, core);
                 let shift = (addr & 2) * 8;
                 let masked = word & !(0xFFFFu32 << shift);
                 let new_word = masked | ((val as u32) << shift);
-                self.ahb_write32(aligned, new_word);
+                self.ahb_write32(aligned, new_word, core);
             }
             0xD => {
                 // Halfword mirror of the write8 SIO arm — see the
@@ -1501,7 +1566,7 @@ impl CoreBus for WorkerBus {
                 self.queue_cache_invalidation(addr, 4);
             }
             0x4 => self.apb_write32(addr, val),
-            0x5 => self.ahb_write32(addr, val),
+            0x5 => self.ahb_write32(addr, val, core),
             0xD => self.sio_write32(addr, val, core),
             _ => {
                 self.shared.atomics.set_bus_fault(core as usize, addr);
@@ -3007,3 +3072,7 @@ mod tests {
 #[cfg(test)]
 #[path = "sio_security_tests.rs"]
 mod sio_security_tests;
+
+#[cfg(test)]
+#[path = "dma_security_tests.rs"]
+mod dma_security_tests;
