@@ -352,3 +352,144 @@ fn nonsecure_rom_hooks_obey_bus_permissions() {
     assert_eq!(cpu.regs.ipsr(), 3);
     assert_eq!(cpu.ppb.bfar, 0x5000);
 }
+
+#[test]
+fn nonsecure_sio_cannot_read_or_inject_secure_fifo_messages() {
+    let (mut cpu, mut bus) = machine(0x6808);
+    bus.write32(0xd000_0054, 0xdead_beef, 1);
+    cpu.regs.r[1] = 0xd000_0058;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.r[0], 0, "NS read the Secure FIFO");
+    assert_eq!(bus.read32(0xd000_0058, 0), 0xdead_beef);
+    cpu.bus_write32(0xd000_0054, 0x1234_5678, &mut bus);
+    assert_eq!(bus.read32(0xd000_0050, 1) & 1, 0, "NS injected into S FIFO");
+    assert_eq!(bus.read32(0xd002_0058, 1), 0x1234_5678);
+}
+
+#[test]
+fn nonsecure_spinlocks_do_not_claim_or_release_secure_locks() {
+    let (mut cpu, mut bus) = machine(0xbf00);
+    assert_eq!(bus.read32(0xd000_010c, 0), 8);
+    assert_eq!(
+        cpu.bus_read32(0xd000_010c, &mut bus),
+        8,
+        "NS lock bank was shared"
+    );
+    cpu.bus_write32(0xd000_010c, 0, &mut bus);
+    assert_eq!(bus.read32(0xd000_005c, 0), 8, "NS released an S lock");
+}
+
+#[test]
+fn nonsecure_doorbells_do_not_modify_secure_pending_bits() {
+    let (mut cpu, mut bus) = machine(0xbf00);
+    bus.write32(0xd000_0180, 1, 1);
+    assert_eq!(
+        cpu.bus_read32(0xd000_0188, &mut bus),
+        0,
+        "NS saw an S doorbell"
+    );
+    cpu.bus_write32(0xd000_018c, 15, &mut bus);
+    assert_eq!(bus.read32(0xd000_0188, 0), 1, "NS cleared an S doorbell");
+}
+
+#[test]
+fn nonsecure_code_cannot_access_the_secure_to_nonsecure_sio_mirror() {
+    let (mut cpu, mut bus) = machine(0x6808);
+    cpu.regs.r[1] = 0xd002_0050;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.ipsr(), 3, "NS accessed the S-only SIO mirror");
+    assert_eq!(cpu.ppb.bfar, 0xd002_0050);
+}
+
+#[test]
+fn nonsecure_gpio_masks_filter_reads_and_preserve_secure_outputs() {
+    for width in [1, 2, 4] {
+        let (mut cpu, mut bus) = machine(0xbf00);
+        bus.write32(0x4006_000c, 0x0f, 0);
+        bus.write32(0xd000_0010, 0x1234_5678, 0);
+        bus.write32(0xd000_0030, 0x8765_4321, 0);
+        assert_eq!(cpu.bus_read32(0xd000_0010, &mut bus), 8, "NS read S GPIO");
+        match width {
+            1 => cpu.bus_write8(0xd000_0010, 0xff, &mut bus),
+            2 => cpu.bus_write16(0xd000_0010, 0xffff, &mut bus),
+            _ => cpu.bus_write32(0xd000_0010, u32::MAX, &mut bus),
+        }
+        assert_eq!(
+            bus.read32(0xd000_0010, 0),
+            0x1234_567f,
+            "NS overwrote S GPIO"
+        );
+        cpu.bus_write32(0xd000_0040, u32::MAX, &mut bus);
+        assert_eq!(bus.read32(0xd000_0030, 0), 0x8765_4320);
+    }
+}
+
+#[test]
+fn interpolators_are_accessible_only_from_the_assigned_sio_bank() {
+    let (mut cpu, mut bus) = machine(0x6808);
+    cpu.regs.r[1] = 0xd000_0080;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.ipsr(), 3, "NS read the Secure interpolator");
+    let (mut cpu, mut bus) = machine(0xbf00);
+    bus.write32(0xd000_0190, 1, 0);
+    cpu.bus_write32(0xd000_0080, 42, &mut bus);
+    assert_eq!(cpu.bus_read32(0xd000_0080, &mut bus), 42);
+    assert!(!bus.bus_fault(0));
+    cpu.transition_to_secure();
+    cpu.bus_read32(0xd000_0080, &mut bus);
+    assert!(bus.bus_fault(0), "S retained the assigned NS interpolator");
+}
+
+#[test]
+fn nonsecure_cannot_reassign_sio_peripherals_or_use_mtime() {
+    for address in [0xd000_0190, 0xd000_01a4, 0xd000_01b0] {
+        let (mut cpu, mut bus) = machine(0x6808);
+        cpu.regs.r[1] = address;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3, "NS touched Secure-only SIO state");
+    }
+}
+
+#[test]
+fn nonsecure_cp0_obeys_gpio_masks() {
+    let (mut cpu, mut bus) = machine(0xbf00);
+    cpu.ppb.nsacr = 1;
+    cpu.ppb.ns.cpacr = 3;
+    bus.write32(0x4006_000c, 15, 0);
+    bus.write32(0xd000_0010, 0x1234_5678, 0);
+    cpu.thumb32_coprocessor(0xee10, 0x0010, &mut bus);
+    assert_eq!(cpu.regs.r[0], 8, "CP0 read bypassed NS GPIO masks");
+    cpu.regs.r[0] = u32::MAX;
+    cpu.thumb32_coprocessor(0xee00, 0x0010, &mut bus);
+    assert_eq!(bus.read32(0xd000_0010, 0), 0x1234_567f, "CP0 wrote S GPIO");
+}
+
+#[test]
+fn nonsecure_gpio_input_and_high_bank_masks_are_enforced() {
+    let (mut cpu, mut bus) = machine(0xbf00);
+    bus.write32(0x4006_000c, 15, 0);
+    bus.write32(0x4006_0010, 15, 0);
+    bus.gpio_in
+        .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+    bus.write32(0xd000_0014, 0x1234_5678, 0);
+    assert_eq!(cpu.bus_read32(0xd000_0004, &mut bus), 15);
+    assert_eq!(cpu.bus_read32(0xd000_0014, &mut bus), 8);
+    cpu.bus_write32(0xd000_0014, u32::MAX, &mut bus);
+    assert_eq!(bus.read32(0xd000_0014, 0), 0x1234_567f);
+}
+
+#[test]
+fn serial_high_gpio_outputs_drive_pins_before_nonsecure_input_filtering() {
+    let mut emu = crate::Emulator::new(crate::Config::default());
+    emu.bus.write32(0xd000_0014, 0x1234, 0);
+    emu.bus.write32(0xd000_0034, 0xffff, 0);
+    emu.update_gpio();
+    assert_eq!(
+        emu.bus.read32(0xd000_0008, 0) & 0xffff,
+        0x1234,
+        "high SIO output did not drive its pins"
+    );
+    let (mut cpu, _) = machine(0xbf00);
+    emu.bus.write32(0x4006_0010, 15, 0);
+    assert_eq!(cpu.bus_read32(0xd000_0008, &mut emu.bus), 4);
+}

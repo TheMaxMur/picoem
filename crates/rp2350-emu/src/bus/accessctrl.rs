@@ -161,8 +161,36 @@ impl AccessCtrl {
         Write::Applied
     }
 
+    pub fn sio_nonsecure(&self, addr: u32, access: Access) -> bool {
+        !self.effective(access).secure || addr & 0xffff_0000 == 0xd002_0000
+    }
+
+    pub fn gpio_mask(&self, addr: u32, core: u8, high: bool) -> u32 {
+        if self.sio_nonsecure(addr, self.contexts[core as usize]) {
+            self.registers[if high { 4 } else { 3 }]
+        } else {
+            u32::MAX
+        }
+    }
+
     pub fn permitted(&self, addr: u32, access: Access) -> bool {
         let access = self.effective(access);
+        if addr >> 28 == 0xd {
+            if addr & 0xffff_0000 == 0xd002_0000 && !access.secure {
+                return false;
+            }
+            let ns = self.sio_nonsecure(addr, access);
+            let offset = addr & 0xfff;
+            let core = usize::from(access.master == Master::Core1);
+            let assigned = match offset {
+                0x080..=0x0bf => Some(1),
+                0x0c0..=0x0ff => Some(2),
+                0x1c0..=0x1df => Some(1 << 5),
+                0x190..=0x193 | 0x1a4..=0x1bf => return !ns,
+                _ => None,
+            };
+            return assigned.is_none_or(|bit| (self.peri_nonsec[core] & bit != 0) == ns);
+        }
         if (0x400e_0000..0x400e_4000).contains(&addr) || (0xe004_0000..0xe004_4000).contains(&addr)
         {
             return access.secure;

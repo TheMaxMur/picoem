@@ -180,6 +180,7 @@ impl ThreadedEmulator {
             boot_ram,
             xip_sram,
             sio,
+            sio_ns,
             pio,
             atomics,
             resets_state,
@@ -240,6 +241,8 @@ impl ThreadedEmulator {
             warned_clk_enable_clear: _,
             reservation: _,
             external_mmio,
+            accessctrl,
+            ref_clk_residue: _,
         } = bus;
         // Host-mounted MMIO devices are Serial-only
         // (`Emulator::mount_mmio` refuses a Threaded emulator); a mount
@@ -272,6 +275,12 @@ impl ThreadedEmulator {
             gpio_external_mask_hi,
         ));
         let shared_sio = Arc::new(ThreadedSio::seed(&sio));
+        let shared_sio_ns = Arc::new(ThreadedSio::seed(&sio_ns));
+        shared_gpio.write_out(1, sio.gpio_hi_out);
+        shared_gpio.write_oe(1, sio.gpio_hi_oe);
+        if let Some(receiver) = sio_ns.pending_fifo_event {
+            atomics.set_event_flag(receiver);
+        }
 
         // Carry any unconsumed single-threaded FIFO-wake signal into the
         // threaded `event_flag` so a WFE wake that was queued on `Sio`
@@ -352,10 +361,11 @@ impl ThreadedEmulator {
         }
 
         let shared = SharedState {
-            accessctrl: Arc::clone(&bus.accessctrl),
+            accessctrl,
             memory: shared_mem,
             gpio: shared_gpio,
             sio: shared_sio,
+            sio_ns: shared_sio_ns,
             pio: Arc::new(threaded_pio),
             monitors: Arc::new(ExclusiveMonitors::new()),
             peripherals,
@@ -784,7 +794,7 @@ fn core_worker_body(
         // Merge coordinator-/peer-asserted IRQs into this core's NVIC.
         // `take_irq_pending` is an `AcqRel` swap-to-zero — the non-zero
         // return is the consume-and-merge trigger (LLD V7 §2).
-        let pending = shared.atomics.take_irq_pending(idx);
+        let pending = shared.atomics.take_irq_pending(idx) | shared.sio_irq_pending(idx);
         if pending != 0 {
             core.ppb.merge_irq_pending(pending);
         }
@@ -3231,7 +3241,7 @@ mod tests {
         /// Distinct from `core_worker_inner_loop_steps_and_drains_invalidations`
         /// in that this asserts the post-run state explicitly: `core0`
         /// + `core1` + `pio_blocks` all hold `Some(_)` (no worker dropped),
-        /// `last_run_timings` stays `None`, and `poisoned` is false.
+        ///   `last_run_timings` stays `None`, and `poisoned` is false.
         #[test]
         fn run_quanta_happy_path_preserves_owned_state() {
             let mut threaded = ThreadedEmulator::from_emulator(Emulator::new(Config::default()));

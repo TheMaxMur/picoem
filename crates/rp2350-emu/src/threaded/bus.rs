@@ -764,36 +764,48 @@ impl WorkerBus {
             addr
         );
 
+        let (ns, mask, peri) = {
+            let ctrl = self.shared.accessctrl.lock().unwrap();
+            (
+                ctrl.sio_nonsecure(addr, ctrl.contexts[core as usize]),
+                ctrl.gpio_mask(addr, core, reg_offset == 8 || reg_offset & 4 != 0),
+                ctrl.peri_nonsec[core as usize],
+            )
+        };
+        let sio = if ns {
+            &self.shared.sio_ns
+        } else {
+            &self.shared.sio
+        };
         match reg_offset {
-            0x000 => core as u32,          // CPUID
-            0x004 => self.gpio_in_fresh(), // GPIO_IN — SIO+PIO from last quantum + fresh external
+            0x000 => core as u32,                 // CPUID
+            0x004 => self.gpio_in_fresh() & mask, // GPIO_IN — SIO+PIO from last quantum + fresh external
             // GPIO_HI_IN — merged bank-1 state plus fresh external overlay.
-            0x008 => self.gpio_hi_in_fresh(),
-            0x010 => self.shared.gpio.read_out(0), // GPIO_OUT
-            0x030 => self.shared.gpio.read_oe(0),  // GPIO_OE
+            0x008 => self.gpio_hi_in_fresh() & mask,
+            0x010 | 0x014 => self.shared.gpio.read_out(usize::from(reg_offset & 4 != 0)) & mask, // GPIO_OUT
+            0x030 | 0x034 => self.shared.gpio.read_oe(usize::from(reg_offset & 4 != 0)) & mask,
+            0x190 => peri, // GPIO_OE
             // FIFO
-            0x050 => self.shared.sio.fifo_st(core as usize), // FIFO_ST
+            0x050 => sio.fifo_st(core as usize), // FIFO_ST
             0x058 => {
                 // FIFO_RD: pop from this core's RX.
-                self.shared.sio.fifo_pop(core as usize).unwrap_or(0)
+                sio.fifo_pop(core as usize).unwrap_or(0)
             }
             // SPINLOCK_ST (0x05C): current spinlock bitmap.
-            0x05C => self.shared.sio.spinlock_bits(),
+            0x05C => sio.spinlock_bits(),
             // Spinlock claim (0x100..=0x17F): test-and-set.
             0x100..=0x17F => {
                 let id = ((reg_offset - 0x100) >> 2) as usize;
-                self.shared.sio.spinlock_claim(id)
+                sio.spinlock_claim(id)
             }
             // DOORBELL_IN_SET read (0x188): current 4-bit doorbell.
-            0x188 => self.shared.sio.doorbell_read(core as usize),
+            0x188 => sio.doorbell_read(core as usize),
             // MTIME registers (0x1A0–0x1BC).
-            0x1A0 => self.shared.sio.mtime_ctrl_read(),
-            0x1A8 => self.shared.sio.mtime_read() as u32,
-            0x1AC => (self.shared.sio.mtime_read() >> 32) as u32,
-            0x1B0 => self.shared.sio.mtimecmp_read(0) as u32,
-            0x1B4 => (self.shared.sio.mtimecmp_read(0) >> 32) as u32,
-            0x1B8 => self.shared.sio.mtimecmp_read(1) as u32,
-            0x1BC => (self.shared.sio.mtimecmp_read(1) >> 32) as u32,
+            0x1A4 => sio.mtime_ctrl_read(),
+            0x1B0 => sio.mtime_read() as u32,
+            0x1B4 => (sio.mtime_read() >> 32) as u32,
+            0x1B8 => sio.mtimecmp_read(core as usize) as u32,
+            0x1BC => (sio.mtimecmp_read(core as usize) >> 32) as u32,
             _ => 0,
         }
     }
@@ -811,23 +823,35 @@ impl WorkerBus {
             addr
         );
 
+        let (ns, mask) = {
+            let ctrl = self.shared.accessctrl.lock().unwrap();
+            (
+                ctrl.sio_nonsecure(addr, ctrl.contexts[core as usize]),
+                ctrl.gpio_mask(addr, core, reg_offset & 4 != 0),
+            )
+        };
+        let sio = if ns {
+            &self.shared.sio_ns
+        } else {
+            &self.shared.sio
+        };
+        let bank = usize::from(reg_offset & 4 != 0);
         match reg_offset {
-            // GPIO_OUT family — 0x010/0x018/0x020/0x028.
-            0x010 => self.shared.gpio.write_out(0, val),
-            0x018 => self.shared.gpio.set_out(0, val),
-            0x020 => self.shared.gpio.clear_out(0, val),
-            0x028 => self.shared.gpio.xor_out(0, val),
-            // GPIO_OE family — 0x030/0x038/0x040/0x048.
-            0x030 => self.shared.gpio.write_oe(0, val),
-            0x038 => self.shared.gpio.set_oe(0, val),
-            0x040 => self.shared.gpio.clear_oe(0, val),
-            0x048 => self.shared.gpio.xor_oe(0, val),
+            0x010 | 0x014 => self.shared.gpio.write_out_masked(bank, val, mask),
+            0x018 | 0x01c => self.shared.gpio.set_out(bank, val & mask),
+            0x020 | 0x024 => self.shared.gpio.clear_out(bank, val & mask),
+            0x028 | 0x02c => self.shared.gpio.xor_out(bank, val & mask),
+            0x030 | 0x034 => self.shared.gpio.write_oe_masked(bank, val, mask),
+            0x038 | 0x03c => self.shared.gpio.set_oe(bank, val & mask),
+            0x040 | 0x044 => self.shared.gpio.clear_oe(bank, val & mask),
+            0x048 | 0x04c => self.shared.gpio.xor_oe(bank, val & mask),
+            0x190 => self.shared.accessctrl.lock().unwrap().peri_nonsec[core as usize] = val & 0x23,
             // FIFO
-            0x050 => self.shared.sio.fifo_st_clear(core as usize, val),
+            0x050 => sio.fifo_st_clear(core as usize, val),
             0x054 => {
                 // FIFO_WR: push to peer core's RX queue.
                 let peer = 1 - (core as usize);
-                if self.shared.sio.fifo_push(core as usize, val) {
+                if sio.fifo_push(core as usize, val) {
                     // WFE wake hook (LLD V7 §6). No IRQ.
                     self.shared.atomics.set_event_flag(peer);
                 }
@@ -835,47 +859,39 @@ impl WorkerBus {
             // Spinlock release (0x100..=0x17F): any write clears.
             0x100..=0x17F => {
                 let id = ((reg_offset - 0x100) >> 2) as usize;
-                self.shared.sio.spinlock_release(id);
+                sio.spinlock_release(id);
             }
             // DOORBELL_OUT_SET (0x180): set bits on peer.
             0x180 => {
                 let peer = 1 - (core as usize);
-                self.shared.sio.doorbell_set(peer, val & 0xF);
+                sio.doorbell_set(peer, val & 0xF);
             }
             // DOORBELL_OUT_CLR (0x184): clear bits on peer.
             0x184 => {
                 let peer = 1 - (core as usize);
-                self.shared.sio.doorbell_clear(peer, val & 0xF);
+                sio.doorbell_clear(peer, val & 0xF);
             }
             // DOORBELL_IN_CLR (0x18C): clear bits on self.
             0x18C => {
-                self.shared.sio.doorbell_clear(core as usize, val & 0xF);
+                sio.doorbell_clear(core as usize, val & 0xF);
             }
             // MTIME registers (0x1A0–0x1BC).
-            0x1A0 => self.shared.sio.mtime_ctrl_write(val),
-            0x1A8 => {
-                let hi = self.shared.sio.mtime_read() & 0xFFFF_FFFF_0000_0000;
-                self.shared.sio.mtime_write(hi | val as u64);
-            }
-            0x1AC => {
-                let lo = self.shared.sio.mtime_read() & 0x0000_0000_FFFF_FFFF;
-                self.shared.sio.mtime_write(lo | ((val as u64) << 32));
-            }
+            0x1A4 => sio.mtime_ctrl_write(val),
             0x1B0 => {
-                let hi = self.shared.sio.mtimecmp_read(0) & 0xFFFF_FFFF_0000_0000;
-                self.shared.sio.mtimecmp_write(0, hi | val as u64);
+                let hi = sio.mtime_read() & 0xFFFF_FFFF_0000_0000;
+                sio.mtime_write(hi | val as u64);
             }
             0x1B4 => {
-                let lo = self.shared.sio.mtimecmp_read(0) & 0x0000_0000_FFFF_FFFF;
-                self.shared.sio.mtimecmp_write(0, lo | ((val as u64) << 32));
+                let lo = sio.mtime_read() & 0x0000_0000_FFFF_FFFF;
+                sio.mtime_write(lo | ((val as u64) << 32));
             }
             0x1B8 => {
-                let hi = self.shared.sio.mtimecmp_read(1) & 0xFFFF_FFFF_0000_0000;
-                self.shared.sio.mtimecmp_write(1, hi | val as u64);
+                let hi = sio.mtimecmp_read(core as usize) & 0xFFFF_FFFF_0000_0000;
+                sio.mtimecmp_write(core as usize, hi | val as u64);
             }
             0x1BC => {
-                let lo = self.shared.sio.mtimecmp_read(1) & 0x0000_0000_FFFF_FFFF;
-                self.shared.sio.mtimecmp_write(1, lo | ((val as u64) << 32));
+                let lo = sio.mtimecmp_read(core as usize) & 0x0000_0000_FFFF_FFFF;
+                sio.mtimecmp_write(core as usize, lo | ((val as u64) << 32));
             }
             _ => {}
         }
@@ -2500,16 +2516,16 @@ mod tests {
             let shared = fresh_shared();
             let mut bus = WorkerBus::new(0, shared.clone());
             // MTIME control + lo/hi + MTIMECMP0/1 lo/hi.
-            bus.write32(0xD000_01A0, 0x1, 0);
-            bus.write32(0xD000_01A8, 0x1234_5678, 0);
-            bus.write32(0xD000_01AC, 0x0000_0001, 0);
-            bus.write32(0xD000_01B0, 0xAABB_CCDD, 0);
+            bus.write32(0xD000_01A4, 0x1, 0);
+            bus.write32(0xD000_01B0, 0x1234_5678, 0);
             bus.write32(0xD000_01B4, 0x0000_0001, 0);
-            bus.write32(0xD000_01B8, 0x1111_1111, 0);
+            bus.write32(0xD000_01B8, 0xAABB_CCDD, 0);
             bus.write32(0xD000_01BC, 0x0000_0001, 0);
+            bus.write32(0xD000_01B8, 0x1111_1111, 1);
+            bus.write32(0xD000_01BC, 0x0000_0001, 1);
             // Verify low/high splitting by reading back full 64-bit view.
-            let lo = bus.read32(0xD000_01A8, 0) as u64;
-            let hi = bus.read32(0xD000_01AC, 0) as u64;
+            let lo = bus.read32(0xD000_01B0, 0) as u64;
+            let hi = bus.read32(0xD000_01B4, 0) as u64;
             assert_eq!((hi << 32) | lo, 0x0000_0001_1234_5678);
         }
 
@@ -2656,20 +2672,20 @@ mod tests {
         fn sio_write8_non_replicating_rmw_fallback() {
             let shared = fresh_shared();
             let mut bus = WorkerBus::new(0, shared);
-            // MTIME control at 0xD000_01A0 is NOT in the replicating set.
-            bus.write32(0xD000_01A0, 0x0000_0000, 0);
-            bus.write8(0xD000_01A0, 0xAB, 0);
+            // MTIME control at 0xD000_01A4 is NOT in the replicating set.
+            bus.write32(0xD000_01A4, 0x0000_0000, 0);
+            bus.write8(0xD000_01A4, 0xAB, 0);
             // RMW path must land the byte in lane 0 only.
-            assert_eq!(bus.read32(0xD000_01A0, 0) & 0xFF, 0xAB);
+            assert_eq!(bus.read32(0xD000_01A4, 0) & 0xFF, 0xAB);
         }
 
         #[test]
         fn sio_write16_non_replicating_rmw_fallback() {
             let shared = fresh_shared();
             let mut bus = WorkerBus::new(0, shared);
-            bus.write32(0xD000_01A8, 0x0000_0000, 0);
-            bus.write16(0xD000_01A8, 0xCAFE, 0);
-            assert_eq!(bus.read32(0xD000_01A8, 0) & 0xFFFF, 0xCAFE);
+            bus.write32(0xD000_01B0, 0x0000_0000, 0);
+            bus.write16(0xD000_01B0, 0xCAFE, 0);
+            assert_eq!(bus.read32(0xD000_01B0, 0) & 0xFFFF, 0xCAFE);
         }
 
         // ---- Unmapped-region bus fault dispatch ------------------------
@@ -2987,3 +3003,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sio_security_tests.rs"]
+mod sio_security_tests;

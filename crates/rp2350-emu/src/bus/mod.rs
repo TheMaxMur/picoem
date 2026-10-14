@@ -461,6 +461,7 @@ pub struct Bus {
     pub(crate) gpio_hi_noise_state: u32,
     /// Single-cycle IO block (GPIO, CPUID, spinlocks, FIFO, divider, etc.).
     pub sio: Sio,
+    pub(crate) sio_ns: Sio,
     /// Three PIO blocks (PIO0, PIO1, PIO2).
     pub pio: [PioBlock; 3],
     /// Combined GPIO pin state (readable by SIO and PIO).
@@ -661,6 +662,7 @@ impl Bus {
             xosc_regs: [0u32; 5],
             gpio_hi_noise_state: 0xA5A5_A5A5,
             sio: Sio::new(),
+            sio_ns: Sio::new(),
             pio: [PioBlock::new(), PioBlock::new(), PioBlock::new()],
             gpio_in: AtomicU32::new(0),
             gpio_in_hi: AtomicU32::new(0),
@@ -883,15 +885,94 @@ impl Bus {
     ///
     /// Covers GPIO_OUT (0x010), GPIO_OUT_SET/CLR/XOR (0x018/0x020/
     /// 0x028) and the OE mirrors GPIO_OE / GPIO_OE_SET/CLR/XOR
-    /// (0x030/0x038/0x040/0x048). GPIO_HI_OUT mirrors are not
-    /// modelled on rp2350_emu (see wrk_docs Phase 5 LLD §Known
-    /// Limitations) so this helper does not include their offsets.
+    /// (0x030/0x038/0x040/0x048), including their high-bank counterparts.
     #[inline]
     pub fn is_sio_gpio_out_replicating_reg(reg_offset: u32) -> bool {
         matches!(
             reg_offset,
-            0x010 | 0x018 | 0x020 | 0x028 | 0x030 | 0x038 | 0x040 | 0x048
+            0x010
+                | 0x014
+                | 0x018
+                | 0x01c
+                | 0x020
+                | 0x024
+                | 0x028
+                | 0x02c
+                | 0x030
+                | 0x034
+                | 0x038
+                | 0x03c
+                | 0x040
+                | 0x044
+                | 0x048
+                | 0x04c
         )
+    }
+
+    fn sio_read32(&mut self, addr: u32, core: u8) -> u32 {
+        let offset = addr & 0xfff;
+        let (ns, mask, peri) = {
+            let ctrl = self.accessctrl.lock().unwrap();
+            (
+                ctrl.sio_nonsecure(addr, ctrl.contexts[core as usize]),
+                ctrl.gpio_mask(addr, core, offset == 8 || offset & 4 != 0),
+                ctrl.peri_nonsec[core as usize],
+            )
+        };
+        match offset {
+            0x004 => self.gpio_in.load(Ordering::Relaxed) & mask,
+            0x008 => self.read_gpio_hi_in() & mask,
+            0x010 | 0x014 => {
+                (if offset & 4 == 0 {
+                    self.sio.gpio_out
+                } else {
+                    self.sio.gpio_hi_out
+                }) & mask
+            }
+            0x030 | 0x034 => {
+                (if offset & 4 == 0 {
+                    self.sio.gpio_oe
+                } else {
+                    self.sio.gpio_hi_oe
+                }) & mask
+            }
+            0x190 => peri,
+            _ => if ns { &mut self.sio_ns } else { &mut self.sio }.read32(offset, core as usize),
+        }
+    }
+
+    fn sio_write32(&mut self, addr: u32, val: u32, core: u8) {
+        let offset = addr & 0xfff;
+        let (ns, mask) = {
+            let ctrl = self.accessctrl.lock().unwrap();
+            (
+                ctrl.sio_nonsecure(addr, ctrl.contexts[core as usize]),
+                ctrl.gpio_mask(addr, core, offset & 4 != 0),
+            )
+        };
+        if Self::is_sio_gpio_out_replicating_reg(offset) {
+            let word = match (offset >= 0x030, offset & 4 != 0) {
+                (false, false) => &mut self.sio.gpio_out,
+                (false, true) => &mut self.sio.gpio_hi_out,
+                (true, false) => &mut self.sio.gpio_oe,
+                (true, true) => &mut self.sio.gpio_hi_oe,
+            };
+            match offset & !4 {
+                0x010 | 0x030 => *word = (*word & !mask) | (val & mask),
+                0x018 | 0x038 => *word |= val & mask,
+                0x020 | 0x040 => *word &= !(val & mask),
+                0x028 | 0x048 => *word ^= val & mask,
+                _ => unreachable!(),
+            }
+        } else if offset == 0x190 {
+            self.accessctrl.lock().unwrap().peri_nonsec[core as usize] = val & 0x23;
+        } else {
+            let sio = if ns { &mut self.sio_ns } else { &mut self.sio };
+            sio.write32(offset, val, core as usize);
+            if let Some(receiver) = sio.pending_fifo_event.take() {
+                self.atomics.set_event_flag(receiver);
+            }
+        }
     }
 
     fn boot_ram_read8(&self, addr: u32) -> u8 {
@@ -1220,6 +1301,12 @@ impl Bus {
             }
             if self.sio.doorbell_pending[core] != 0 {
                 self.assert_irq_core(core, IRQ_SIO_IRQ_BELL);
+            }
+            if self.sio_ns.fifo_irq_level(core) {
+                self.assert_irq_core(core, crate::irq::IRQ_SIO_IRQ_FIFO_NS);
+            }
+            if self.sio_ns.doorbell_pending[core] != 0 {
+                self.assert_irq_core(core, crate::irq::IRQ_SIO_IRQ_BELL_NS);
             }
         }
 
@@ -1803,11 +1890,7 @@ impl Bus {
                     "DIV/INTERP addr 0x{:08X} reached Bus::read8 — use CortexM33::bus_read8 wrapper",
                     addr
                 );
-                let word = match word_offset {
-                    0x004 => self.gpio_in.load(Ordering::Relaxed),
-                    0x008 => self.read_gpio_hi_in(),
-                    _ => self.sio.read32(word_offset, core as usize),
-                };
+                let word = self.sio_read32(addr & !3, core);
                 word.to_le_bytes()[(addr & 3) as usize]
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read8(addr),
@@ -2363,11 +2446,7 @@ impl Bus {
                     // preserves FIFO_WR / doorbell / softirq
                     // semantics for any byte-lane access that hits
                     // a side-effect offset.
-                    let old_word = match reg_offset {
-                        0x004 => self.gpio_in.load(Ordering::Relaxed),
-                        0x008 => self.read_gpio_hi_in(),
-                        _ => self.sio.read32(reg_offset, core as usize),
-                    };
+                    let old_word = self.sio_read32(word_addr, core);
                     let mut bytes = old_word.to_le_bytes();
                     bytes[byte_idx] = val;
                     self.write32(word_addr, u32::from_le_bytes(bytes), core);
@@ -2605,11 +2684,7 @@ impl Bus {
                     "DIV/INTERP addr 0x{:08X} reached Bus::read16 — use CortexM33::bus_read16 wrapper",
                     addr
                 );
-                let word = match word_offset {
-                    0x004 => self.gpio_in.load(Ordering::Relaxed),
-                    0x008 => self.read_gpio_hi_in(),
-                    _ => self.sio.read32(word_offset, core as usize),
-                };
+                let word = self.sio_read32(addr & !3, core);
                 let half_idx = ((addr >> 1) & 1) as usize;
                 [word as u16, (word >> 16) as u16][half_idx]
             }
@@ -3107,11 +3182,7 @@ impl Bus {
                 } else {
                     let half_idx = ((addr >> 1) & 1) as usize;
                     // core is the outer write8/16/32 param
-                    let old_word = match reg_offset {
-                        0x004 => self.gpio_in.load(Ordering::Relaxed),
-                        0x008 => self.read_gpio_hi_in(),
-                        _ => self.sio.read32(reg_offset, core as usize),
-                    };
+                    let old_word = self.sio_read32(word_addr, core);
                     let mut halves: [u16; 2] = [old_word as u16, (old_word >> 16) as u16];
                     halves[half_idx] = val;
                     let merged = (halves[0] as u32) | ((halves[1] as u32) << 16);
@@ -3268,11 +3339,7 @@ impl Bus {
                     "DIV/INTERP addr 0x{:08X} reached Bus::read32 — use CortexM33::bus_read32 wrapper",
                     addr
                 );
-                match reg_offset {
-                    0x004 => self.gpio_in.load(Ordering::Relaxed),
-                    0x008 => self.read_gpio_hi_in(),
-                    _ => self.sio.read32(reg_offset, core as usize),
-                }
+                self.sio_read32(addr, core)
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_read32(addr),
             0xE if Self::is_coresight_trace(addr) => {
@@ -3493,11 +3560,7 @@ impl Bus {
                     "DIV/INTERP addr 0x{:08X} reached Bus::write32 — use CortexM33::bus_write32 wrapper",
                     addr
                 );
-                self.sio.write32(reg_offset, val, core as usize);
-                // FIFO_WR event signaling: set event_flag for receiver core.
-                if let Some(receiver) = self.sio.pending_fifo_event.take() {
-                    self.atomics.set_event_flag(receiver);
-                }
+                self.sio_write32(addr, val, core);
             }
             0xE if Self::is_boot_ram(addr) => self.boot_ram_write32(addr, val),
             0xE if Self::is_coresight_trace(addr) => {

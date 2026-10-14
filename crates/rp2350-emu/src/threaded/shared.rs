@@ -35,6 +35,7 @@ pub struct SharedState {
     pub gpio: Arc<AtomicGpio>,
     /// Cross-core SIO surface: FIFOs, spinlocks, doorbells, mtime.
     pub sio: Arc<ThreadedSio>,
+    pub(crate) sio_ns: Arc<ThreadedSio>,
     /// PIO TX/RX FIFOs + command queue + control atomics.
     pub pio: Arc<ThreadedPio>,
     /// LDREX/STREX exclusive-monitor tracking.
@@ -58,16 +59,46 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Construct a fresh `SharedState` with every inner component in
-    /// its default / post-bootrom state. Stage 6's `from_emulator`
-    /// consumes existing Bus fields instead; this constructor exists
-    /// for unit tests and any future standalone use.
+    #[cfg(any(
+        test,
+        all(
+            feature = "threading",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )
+    ))]
+    pub(crate) fn sio_irq_pending(&self, core: usize) -> u64 {
+        let mut pending = 0;
+        for (sio, fifo, bell) in [
+            (
+                &self.sio,
+                crate::irq::IRQ_SIO_IRQ_FIFO,
+                crate::irq::IRQ_SIO_IRQ_BELL,
+            ),
+            (
+                &self.sio_ns,
+                crate::irq::IRQ_SIO_IRQ_FIFO_NS,
+                crate::irq::IRQ_SIO_IRQ_BELL_NS,
+            ),
+        ] {
+            if sio.fifo_st(core) & 0x0d != 0 {
+                pending |= 1u64 << fifo;
+            }
+            if sio.doorbell_read(core) != 0 {
+                pending |= 1u64 << bell;
+            }
+        }
+        pending
+    }
+
+    /// Construct post-bootrom state for standalone model tests.
     pub fn new_default() -> Self {
         Self {
             accessctrl: Arc::new(Mutex::new(crate::bus::accessctrl::AccessCtrl::default())),
             memory: Arc::new(SharedMemory::new()),
             gpio: Arc::new(AtomicGpio::new()),
             sio: Arc::new(ThreadedSio::new()),
+            sio_ns: Arc::new(ThreadedSio::new()),
             pio: Arc::new(ThreadedPio::new()),
             monitors: Arc::new(ExclusiveMonitors::new()),
             peripherals: Arc::new(Peripherals::new_default()),

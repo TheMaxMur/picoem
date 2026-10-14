@@ -150,6 +150,18 @@ impl AtomicGpio {
         }
     }
 
+    pub(crate) fn write_out_masked(&self, bank: usize, value: u32, mask: u32) {
+        self.out[bank]
+            .fetch_update(Relaxed, Relaxed, |old| Some((old & !mask) | (value & mask)))
+            .unwrap();
+    }
+
+    pub(crate) fn write_oe_masked(&self, bank: usize, value: u32, mask: u32) {
+        self.oe[bank]
+            .fetch_update(Relaxed, Relaxed, |old| Some((old & !mask) | (value & mask)))
+            .unwrap();
+    }
+
     // ---- GPIO_IN (merged pin state) ----------------------------------------
 
     /// Read the merged GPIO_IN value (low 32 pins).

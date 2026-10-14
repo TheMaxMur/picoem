@@ -37,6 +37,8 @@ pub struct Sio {
     pub gpio_out: u32,
     /// SIO GPIO output enable register (offset 0x030).
     pub gpio_oe: u32,
+    pub(crate) gpio_hi_out: u32,
+    pub(crate) gpio_hi_oe: u32,
     /// Inter-processor FIFO: Core 0 writes -> Core 1 reads.
     fifo_to_core1: Fifo,
     /// Inter-processor FIFO: Core 1 writes -> Core 0 reads.
@@ -79,6 +81,8 @@ impl Sio {
         Self {
             gpio_out: 0,
             gpio_oe: 0,
+            gpio_hi_out: 0,
+            gpio_hi_oe: 0,
             fifo_to_core1: Fifo::new(),
             fifo_to_core0: Fifo::new(),
             fifo_wof: [false; 2],
@@ -139,6 +143,8 @@ impl Sio {
     pub fn reset(&mut self) {
         self.gpio_out = 0;
         self.gpio_oe = 0;
+        self.gpio_hi_out = 0;
+        self.gpio_hi_oe = 0;
         self.fifo_to_core1 = Fifo::new();
         self.fifo_to_core0 = Fifo::new();
         self.fifo_wof = [false; 2];

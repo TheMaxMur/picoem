@@ -759,20 +759,11 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_pacer_behind_detection() {
-        // Using u32::MAX as sys_clk_hz makes quantum_tsc_ticks extremely small,
-        // so any real work between begin/end will be "behind".
-        let mut pacer = Pacer::new(u32::MAX);
+        // A millisecond quantum also works on coarse virtual TSCs; the
+        // overrun must reach end_quantum rather than fail construction.
+        let mut pacer = Pacer::with_quantum(150_000_000, 150_000);
         pacer.begin_quantum();
-        // Burn some time.
-        // `black_box` must be INSIDE the loop: LLVM will otherwise fold
-        // the running sum to a closed-form arithmetic series, collapsing
-        // the burn to ~25 ns (two rdtscp calls) — below the ~78-tick
-        // threshold for a u32::MAX-sysclk Pacer, so behind_count stays 0.
-        let mut dummy = 0u64;
-        for i in 0..10_000 {
-            dummy = std::hint::black_box(dummy.wrapping_add(i));
-        }
-        std::hint::black_box(dummy);
+        std::thread::sleep(std::time::Duration::from_millis(2));
         pacer.end_quantum();
 
         let snap = pacer.stats().snapshot();
