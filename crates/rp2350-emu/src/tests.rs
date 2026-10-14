@@ -19776,31 +19776,43 @@ mod stage7_exceptions_coverage {
         assert_eq!(cpu.regs.r[14] & 0xF, 0xD);
     }
 
-    // Exit with bogus EXC_RETURN (FType=0 but FPCAR=0, LSPACT=0) → INVPC.
     #[test]
-    fn exit_invpc_when_ftype0_no_reservation() {
+    fn exit_fp_frame_does_not_require_fpcar_metadata() {
         let (mut cpu, mut bus) = core_bus();
-        // Put core in a handler.
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
         cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        for offset in (0..104).step_by(4) {
+            bus.write32(cpu.regs.msp + offset, 0, 0);
+        }
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        bus.write32(cpu.regs.msp + 32, 1.25f32.to_bits(), 0);
         cpu.ppb.fpcar = 0;
-        cpu.ppb.fpccr = 0; // LSPACT=0
-        // EXC_RETURN claims FP frame.
-        let exc_return = 0xFFFF_FFE9u32;
-        let cycles = cpu.exit_exception(exc_return, &mut bus);
-        assert_eq!(cycles, 0);
-        assert!(matches!(cpu.pending_fault, Some(Fault::UsageFault)));
-        assert_ne!(cpu.ppb.cfsr & (1 << 17), 0, "INVPC");
+        cpu.ppb.fpccr = 0;
+        assert!(cpu.exit_exception(0xFFFF_FFE9, &mut bus) > 0);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(cpu.regs.s[0], 1.25);
+        assert_eq!(cpu.regs.msp, 0x2000_0F68);
     }
 
     #[test]
-    fn exit_invpc_when_ftype1_but_lspact_set() {
+    fn exit_basic_frame_does_not_consume_another_lazy_reservation() {
         let (mut cpu, mut bus) = core_bus();
+        cpu.regs.msp = 0x2000_0F00;
+        cpu.regs.r[13] = cpu.regs.msp;
         cpu.regs.xpsr = (cpu.regs.xpsr & !0x1FF) | 14;
+        for offset in (0..32).step_by(4) {
+            bus.write32(cpu.regs.msp + offset, 0, 0);
+        }
+        bus.write32(cpu.regs.msp + 24, HANDLER_ADDR, 0);
+        bus.write32(cpu.regs.msp + 28, 1 << 24, 0);
+        cpu.ppb.fpcar = 0x2000_FF00;
         cpu.ppb.fpccr = FPCCR_LSPACT;
-        // EXC_RETURN says no FP frame but LSPACT is outstanding.
-        let exc_return = 0xFFFF_FFF9u32;
-        let _ = cpu.exit_exception(exc_return, &mut bus);
-        assert_ne!(cpu.ppb.cfsr & (1 << 17), 0, "INVPC");
+        assert!(cpu.exit_exception(0xFFFF_FFF9, &mut bus) > 0);
+        assert!(cpu.pending_fault.is_none());
+        assert_eq!(cpu.ppb.fpcar, 0x2000_FF00);
+        assert_ne!(cpu.ppb.fpccr & FPCCR_LSPACT, 0);
     }
 
     // Normal exit with FP frame + LSPACT=1 (skip pop path).
@@ -24766,8 +24778,8 @@ mod stage2_exceptions_corecasecoverage {
         assert!(cycles > 0, "exit must succeed");
         assert!(cpu.pending_fault.is_none(), "no INVPC raised");
         // Confirm the integrity check went through to the eager-pop path
-        // (CFSR.UFSR.INVPC bit 17 must NOT be set).
-        assert_eq!(cpu.ppb.cfsr & (1 << 17), 0, "INVPC bit clear");
+        // (CFSR.UFSR.INVPC bit 18 must NOT be set).
+        assert_eq!(cpu.ppb.cfsr & (1 << 18), 0, "INVPC bit clear");
     }
 }
 

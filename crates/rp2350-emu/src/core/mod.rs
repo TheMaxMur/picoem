@@ -1588,3 +1588,7 @@ mod tests {
 #[cfg(test)]
 #[path = "security_tests.rs"]
 mod security_tests;
+
+#[cfg(test)]
+#[path = "nested_fp_tests.rs"]
+mod nested_fp_tests;

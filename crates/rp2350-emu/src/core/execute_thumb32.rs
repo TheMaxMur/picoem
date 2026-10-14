@@ -2237,6 +2237,7 @@ impl CortexM33 {
         _hw1: u16,
         _bus: &mut B,
     ) -> u32 {
+        self.ppb.cfsr |= 1 << 16;
         self.pending_fault = Some(super::Fault::UsageFault);
         0
     }

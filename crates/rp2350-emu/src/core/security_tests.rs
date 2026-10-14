@@ -302,6 +302,16 @@ fn corrupted_secure_integrity_signature_prevents_register_restore() {
 }
 
 #[test]
+fn a_forged_fp_frame_type_cannot_restore_secure_registers() {
+    let (mut cpu, mut bus) = irq_machine(true);
+    cpu.regs.set_lr(cpu.regs.lr() & !(1 << 4));
+    cpu.step(&mut bus);
+    assert_ne!(cpu.ppb.sfsr & (1 << 1), 0);
+    assert_eq!(cpu.regs.r[4], 0, "forged FType restored S registers");
+    assert_eq!(cpu.regs.ipsr(), 7);
+}
+
+#[test]
 fn real_nonsecure_loads_obey_peripheral_accessctrl_filters() {
     for address in [
         0x5010_0000,

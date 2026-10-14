@@ -15,12 +15,8 @@ pub(crate) const CONTROL_FPCA: u32 = 1 << 2;
 /// Stage B introduced the FP-region contribution.
 const UFSR_STKOF: u32 = 1 << 20;
 
-/// CFSR.UFSR.INVPC (bit 17) — integrity check failure on EXC_RETURN.
-/// Set by `exit_exception` on an FP-frame mismatch: either EXC_RETURN[4]=0
-/// claims an FP frame but no entry path ever reserved one (FPCAR=0 and
-/// LSPACT=0), or EXC_RETURN[4]=1 claims no FP frame but FPCCR.LSPACT=1 is
-/// still set from a lazy reserve at entry.
-const UFSR_INVPC: u32 = 1 << 17;
+/// CFSR.UFSR.INVPC: an invalid exception return.
+const UFSR_INVPC: u32 = 1 << 18;
 
 /// EXC_RETURN fields (ARMv8-M §B3.19): ES, the handler's security state;
 /// SPSEL and Mode of the interrupted context; FType (1: no FP frame);
@@ -360,39 +356,8 @@ impl CortexM33 {
         // FType=0 (bit 4 clear) ⇒ FP frame present and must be unwound.
         let had_fp_frame = exc_return & 0x10 == 0;
 
-        // Integrity check (DDI0553 §B3.4.4 ExceptionReturn): EXC_RETURN[4]
-        // must match the FP state reserved at entry. Two inconsistent-state
-        // cases both raise UsageFault.INVPC:
-        //
-        //   1. FType=0 (had_fp_frame) but no entry path ever reserved an FP
-        //      frame — FPCAR=0 and LSPACT=0. LR was fabricated.
-        //   2. FType=1 (no_fp_frame) but FPCCR.LSPACT=1 — a lazy reservation
-        //      from entry is still outstanding, so the handler is returning
-        //      with an EXC_RETURN that claims no FP context despite one
-        //      being architecturally pending. Silently clearing LSPACT would
-        //      leave FPCAR pointing at (potentially) stale stack memory, so
-        //      the next thread-mode FP op would flush into that region.
-        //      The spec-correct response is to catch the mismatch.
-        //
-        // Rationale for not silent-clearing: the integrity check catches the
-        // handler bug; a silent clear would mask it and allow a stale-FPCAR
-        // flush to corrupt memory on the next FP op.
-        {
-            let fpccr = self.ppb.fpccr;
-            let lspact = fpccr & FPCCR_LSPACT != 0;
-            let bogus = if had_fp_frame {
-                // Case 1: FType=0 but nothing reserved.
-                !lspact && self.ppb.fpcar == 0
-            } else {
-                // Case 2: FType=1 but a lazy reservation is outstanding.
-                lspact
-            };
-            if bogus {
-                self.ppb.cfsr |= UFSR_INVPC;
-                self.pending_fault = Some(Fault::UsageFault);
-                return 0;
-            }
-        }
+        // Arm DDI0553 E2.1.231: a basic nested frame leaves an outer lazy
+        // FP reservation intact. FPCAR does not authenticate a return frame.
 
         // Handler-mode instructions may have modified r[13] (MSP) without
         // syncing to the banked field. Flush now for correct unstack addr.
@@ -870,8 +835,6 @@ impl CortexM33 {
                 }
             }
             Fault::UsageFault => {
-                // Set UFSR.UNDEFINSTR (bit 16 of CFSR)
-                self.ppb.cfsr |= 1 << 16;
                 if self.ppb.shcsr & (1 << 18) != 0 {
                     // USGFAULTENA
                     self.enter_exception(6, bus)
