@@ -352,6 +352,7 @@ impl ThreadedEmulator {
         }
 
         let shared = SharedState {
+            accessctrl: Arc::clone(&bus.accessctrl),
             memory: shared_mem,
             gpio: shared_gpio,
             sio: shared_sio,

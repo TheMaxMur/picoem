@@ -13,8 +13,8 @@
 //! publish cycle advancement without contending with the CPU workers'
 //! PLL CS reads — see `bus/peripherals.rs` and LLD V7 §3/§4.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 use crate::threaded::{
     atomics::CoreAtomics, gpio::AtomicGpio, memory::SharedMemory, monitors::ExclusiveMonitors,
@@ -28,6 +28,7 @@ use crate::threaded::{
 /// for `peripherals`).
 #[derive(Clone)]
 pub struct SharedState {
+    pub(crate) accessctrl: Arc<Mutex<crate::bus::accessctrl::AccessCtrl>>,
     /// Shared SRAM / ROM / XIP memory (atomic word + plain byte slices).
     pub memory: Arc<SharedMemory>,
     /// GPIO output / output-enable state (two-bank u32 atomics).
@@ -63,6 +64,7 @@ impl SharedState {
     /// for unit tests and any future standalone use.
     pub fn new_default() -> Self {
         Self {
+            accessctrl: Arc::new(Mutex::new(crate::bus::accessctrl::AccessCtrl::default())),
             memory: Arc::new(SharedMemory::new()),
             gpio: Arc::new(AtomicGpio::new()),
             sio: Arc::new(ThreadedSio::new()),

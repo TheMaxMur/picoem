@@ -1,3 +1,4 @@
+pub(crate) mod accessctrl;
 pub mod clocks;
 pub mod mmio_device;
 pub mod peripherals;
@@ -5,8 +6,8 @@ pub mod ppb;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tracing::debug;
 
@@ -289,6 +290,7 @@ pub(crate) fn reset_bit_for_base(base: u32) -> Option<u8> {
 /// Phase 1: flat memory, single-cycle access everywhere.
 /// Phase 2 adds AHB5 arbitration, APB bridge latency, bus contention.
 pub struct Bus {
+    pub(crate) accessctrl: Arc<Mutex<accessctrl::AccessCtrl>>,
     pub memory: Memory,
     /// Total cycles of the most recent bus access (for testing/debug).
     pub(crate) last_access_cycles: u32,
@@ -622,6 +624,7 @@ impl Bus {
             pwm: PwmRegs::new(IRQ_PWM_IRQ_WRAP_0, IRQ_PWM_IRQ_WRAP_1),
             io_bank0: IoBank0Regs::new(),
             pads_bank0: PadsBank0Regs::new(),
+            accessctrl: Arc::new(Mutex::new(accessctrl::AccessCtrl::default())),
             dma: Dma::new(),
             atomics,
             syscfg: SysCfg::new(),
@@ -1622,6 +1625,9 @@ impl Bus {
     // --- 8-bit access ---
 
     pub fn read8(&mut self, addr: u32, core: u8) -> u8 {
+        if accessctrl::AccessCtrl::owns(addr) {
+            return (self.accessctrl.lock().unwrap().read(addr) >> ((addr & 3) * 8)) as u8;
+        }
         let addr = canon_oracle_addr(addr);
         let region = addr >> 28;
         let (cycles, extra) = Self::read_latency(region);
@@ -1823,6 +1829,16 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        if accessctrl::AccessCtrl::owns(addr) {
+            let mut policy = self.accessctrl.lock().unwrap();
+            let access = policy.contexts[core as usize];
+            if policy.write(addr, u32::from(val) * 0x0101_0101, access)
+                == accessctrl::Write::BusError
+            {
+                self.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
         let addr = canon_oracle_addr(addr);
         // RV32A: any write can invalidate an LR/SC reservation on either
         // core. HLD §4.7.
@@ -2402,6 +2418,9 @@ impl Bus {
     // --- 16-bit access ---
 
     pub fn read16(&mut self, addr: u32, core: u8) -> u16 {
+        if accessctrl::AccessCtrl::owns(addr) {
+            return (self.accessctrl.lock().unwrap().read(addr) >> ((addr & 2) * 8)) as u16;
+        }
         let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses route through
         // `CortexM33::bus_read16`. Bus-level read16 is still reachable
@@ -2613,6 +2632,16 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        if accessctrl::AccessCtrl::owns(addr) {
+            let mut policy = self.accessctrl.lock().unwrap();
+            let access = policy.contexts[core as usize];
+            if policy.write(addr, u32::from(val) * 0x0001_0001, access)
+                == accessctrl::Write::BusError
+            {
+                self.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
         let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses route through
         // `CortexM33::bus_write16`.
@@ -3109,6 +3138,9 @@ impl Bus {
     // --- 32-bit access ---
 
     pub fn read32(&mut self, addr: u32, core: u8) -> u32 {
+        if accessctrl::AccessCtrl::owns(addr) {
+            return self.accessctrl.lock().unwrap().read(addr);
+        }
         let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses are routed through
         // `CortexM33::bus_read32` before reaching here. Anything at
@@ -3258,6 +3290,14 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32, core: u8) {
+        if accessctrl::AccessCtrl::owns(addr) {
+            let mut policy = self.accessctrl.lock().unwrap();
+            let access = policy.contexts[core as usize];
+            if policy.write(addr, val, access) == accessctrl::Write::BusError {
+                self.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
         let addr = canon_oracle_addr(addr);
         // Phase 0b.1 Commit B: PPB addresses are routed through
         // `CortexM33::bus_write32` before reaching here.
@@ -3625,6 +3665,29 @@ impl Default for Bus {
 use crate::core::bus_trait::CoreBus;
 
 impl CoreBus for Bus {
+    fn begin_access(
+        &mut self,
+        addr: u32,
+        size: u32,
+        core: u8,
+        secure: bool,
+        privileged: bool,
+    ) -> bool {
+        let mut policy = self.accessctrl.lock().unwrap();
+        let access = accessctrl::Access::core(core, secure, privileged);
+        policy.contexts[core as usize] = policy.effective(access);
+        if !policy.permitted(addr, access) || !policy.permitted(addr.wrapping_add(size - 1), access)
+        {
+            self.atomics.set_bus_fault(core as usize, addr);
+            return false;
+        }
+        true
+    }
+
+    fn end_access(&mut self, core: u8) {
+        self.accessctrl.lock().unwrap().contexts[core as usize] = accessctrl::Access::debugger();
+    }
+
     #[inline(always)]
     fn read8(&mut self, addr: u32, core: u8) -> u8 {
         Bus::read8(self, addr, core)

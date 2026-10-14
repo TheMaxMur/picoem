@@ -488,21 +488,20 @@ impl CortexM33 {
         // the quantum boundary and propagates `shutdown_requested` on
         // the `Emulator`.
         let pc = self.regs.pc();
-        if pc < ROM_HOOK_PC_END && !self.check_fetch(pc, 2, bus) {
-            if let Some(fault) = self.pending_fault.take() {
-                let cost = self.deliver_fault(fault, bus);
-                self.cycles = self.cycles.wrapping_add(cost as u64);
-            }
-            return;
-        }
-        if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
+        let reboot_entry =
+            Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns;
+        let hook_allowed = (pc < ROM_HOOK_PC_END || reboot_entry) && self.rom_hook_allowed(pc, bus);
+        if hook_allowed
+            && (Some(pc) == self.bootrom_reboot_hook_pc_s
+                || Some(pc) == self.bootrom_reboot_hook_pc_ns)
+        {
             self.bootrom_hook_fired = true;
             self.atomics.set_halted(core);
             return;
         }
         // Host-serviced ROM-call hooks: every hook PC is a ROM entry, so
         // code running anywhere else pays this one compare.
-        if pc < ROM_HOOK_PC_END && self.rom_call_hook_hit(pc) {
+        if hook_allowed && self.rom_call_hook_hit(pc) {
             return;
         }
 
@@ -586,19 +585,18 @@ impl CortexM33 {
         // Bootrom mask-ROM hook — same shape as `Self::step`, see HLD
         // V5 §"Component 3 — Bootrom mask-ROM" / "Hook check placement".
         let pc = self.regs.pc();
-        if pc < ROM_HOOK_PC_END && !self.check_fetch(pc, 2, bus) {
-            if let Some(fault) = self.pending_fault.take() {
-                let cost = self.deliver_fault(fault, bus);
-                self.cycles = self.cycles.wrapping_add(cost as u64);
-            }
-            return;
-        }
-        if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
+        let reboot_entry =
+            Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns;
+        let hook_allowed = (pc < ROM_HOOK_PC_END || reboot_entry) && self.rom_hook_allowed(pc, bus);
+        if hook_allowed
+            && (Some(pc) == self.bootrom_reboot_hook_pc_s
+                || Some(pc) == self.bootrom_reboot_hook_pc_ns)
+        {
             self.bootrom_hook_fired = true;
             self.atomics.set_halted(self.core_id as usize);
             return;
         }
-        if pc < ROM_HOOK_PC_END && self.rom_call_hook_hit(pc) {
+        if hook_allowed && self.rom_call_hook_hit(pc) {
             return;
         }
 
@@ -650,6 +648,14 @@ impl CortexM33 {
     /// `pc` is below [`ROM_HOOK_PC_END`]. On a hit the core records
     /// [`Self::rom_call_pending`] and halts without dispatching the
     /// instruction, for [`crate::Emulator::return_from_rom_call`].
+    fn rom_hook_allowed<B: CoreBus>(&mut self, pc: u32, bus: &mut B) -> bool {
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        let allowed = bus.begin_access(pc, 2, self.core_id, self.secure, privileged)
+            && self.check_fetch(pc, 2, bus);
+        bus.end_access(self.core_id);
+        allowed
+    }
+
     fn rom_call_hook_hit(&mut self, pc: u32) -> bool {
         let Some(&(_, code)) = self.rom_call_hooks.iter().find(|(hook, _)| *hook == pc) else {
             return false;
@@ -891,155 +897,203 @@ impl CortexM33 {
         if !self.check_data_access(addr, 4, false) {
             return 0;
         }
-        self.counters.classify_access(addr, false);
-        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            let val = self.ppb_read32(addr);
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
-            }
-            val
-        } else if Self::is_sio_local(addr) {
-            let val = self.sio_local.read32(addr & 0xFFF);
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
-            }
-            val
-        } else {
-            bus.read32(addr, self.core_id)
+
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        if !bus.begin_access(addr, 4, self.core_id, self.secure, privileged) {
+            bus.end_access(self.core_id);
+            return 0;
         }
+        let result = {
+            self.counters.classify_access(addr, false);
+            if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+                let val = self.ppb_read32(addr);
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
+                }
+                val
+            } else if Self::is_sio_local(addr) {
+                let val = self.sio_local.read32(addr & 0xFFF);
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('R', 4, addr, val, self.core_id);
+                }
+                val
+            } else {
+                bus.read32(addr, self.core_id)
+            }
+        };
+        bus.end_access(self.core_id);
+        result
     }
 
     pub(crate) fn bus_write32<B: CoreBus>(&mut self, addr: u32, val: u32, bus: &mut B) {
         if !self.check_data_access(addr, 4, true) {
             return;
         }
-        self.counters.classify_access(addr, true);
-        // Phase 0b.2: any data-side write invalidates a peer core's
-        // exclusive monitor. `Emulator::step` snoops this flag after the
-        // core's quantum slice and clears the peer's `exclusive_address`.
-        self.did_write_this_quantum = true;
-        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            self.ppb_write32(addr, val);
-            self.sync_nvic_to_irq_pending(addr, bus);
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('W', 4, addr, val, self.core_id);
-            }
-        } else if Self::is_sio_local(addr) {
-            self.sio_local.write32(addr & 0xFFF, val);
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('W', 4, addr, val, self.core_id);
-            }
-        } else {
-            bus.write32(addr, val, self.core_id);
+
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        if !bus.begin_access(addr, 4, self.core_id, self.secure, privileged) {
+            bus.end_access(self.core_id);
+            return;
         }
+        {
+            self.counters.classify_access(addr, true);
+            // Phase 0b.2: any data-side write invalidates a peer core's
+            // exclusive monitor. `Emulator::step` snoops this flag after the
+            // core's quantum slice and clears the peer's `exclusive_address`.
+            self.did_write_this_quantum = true;
+            if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+                self.ppb_write32(addr, val);
+                self.sync_nvic_to_irq_pending(addr, bus);
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('W', 4, addr, val, self.core_id);
+                }
+            } else if Self::is_sio_local(addr) {
+                self.sio_local.write32(addr & 0xFFF, val);
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('W', 4, addr, val, self.core_id);
+                }
+            } else {
+                bus.write32(addr, val, self.core_id);
+            }
+        };
+        bus.end_access(self.core_id);
     }
 
     pub(crate) fn bus_read16<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u16 {
         if !self.check_data_access(addr, 2, false) {
             return 0;
         }
-        self.counters.classify_access(addr, false);
-        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            // ARMv8-M: halfword PPB accesses are UNPREDICTABLE (word-only
-            // registers). We defensively compose the result from the
-            // containing 32-bit register rather than faulting, so rogue
-            // firmware sees plausible data. Contrast bus_read8, which
-            // returns 0 — byte access is more unusual and worth flagging
-            // via a telltale zero.
-            let word = self.ppb_read32(addr & !3);
-            let val = if addr & 2 != 0 {
-                (word >> 16) as u16
-            } else {
-                word as u16
-            };
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
-            }
-            val
-        } else if Self::is_sio_local(addr) {
-            // Matches the pre-Stage-3 `Bus::read16` 0xD path: read the
-            // containing 32-bit SIO register and slice the halfword.
-            let word = self.sio_local.read32(addr & 0xFFF & !3);
-            let val = if addr & 2 != 0 {
-                (word >> 16) as u16
-            } else {
-                word as u16
-            };
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
-            }
-            val
-        } else {
-            bus.read16(addr, self.core_id)
+
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        if !bus.begin_access(addr, 2, self.core_id, self.secure, privileged) {
+            bus.end_access(self.core_id);
+            return 0;
         }
+        let result = {
+            self.counters.classify_access(addr, false);
+            if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+                // ARMv8-M: halfword PPB accesses are UNPREDICTABLE (word-only
+                // registers). We defensively compose the result from the
+                // containing 32-bit register rather than faulting, so rogue
+                // firmware sees plausible data. Contrast bus_read8, which
+                // returns 0 — byte access is more unusual and worth flagging
+                // via a telltale zero.
+                let word = self.ppb_read32(addr & !3);
+                let val = if addr & 2 != 0 {
+                    (word >> 16) as u16
+                } else {
+                    word as u16
+                };
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
+                }
+                val
+            } else if Self::is_sio_local(addr) {
+                // Matches the pre-Stage-3 `Bus::read16` 0xD path: read the
+                // containing 32-bit SIO register and slice the halfword.
+                let word = self.sio_local.read32(addr & 0xFFF & !3);
+                let val = if addr & 2 != 0 {
+                    (word >> 16) as u16
+                } else {
+                    word as u16
+                };
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('R', 2, addr, val as u32, self.core_id);
+                }
+                val
+            } else {
+                bus.read16(addr, self.core_id)
+            }
+        };
+        bus.end_access(self.core_id);
+        result
     }
 
     pub(crate) fn bus_write16<B: CoreBus>(&mut self, addr: u32, val: u16, bus: &mut B) {
         if !self.check_data_access(addr, 2, true) {
             return;
         }
-        self.counters.classify_access(addr, true);
-        // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
-        self.did_write_this_quantum = true;
-        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            // ARMv8-M: halfword PPB accesses are UNPREDICTABLE. We
-            // defensively RMW the matching half of the containing 32-bit
-            // register rather than faulting. Contrast bus_write8, which
-            // drops the write — byte writes to PPB are more unusual.
-            let old = self.ppb_read32(addr & !3);
-            let new_val = if addr & 2 != 0 {
-                (old & 0x0000_FFFF) | ((val as u32) << 16)
-            } else {
-                (old & 0xFFFF_0000) | val as u32
-            };
-            self.ppb_write32(addr & !3, new_val);
-            self.sync_nvic_to_irq_pending(addr & !3, bus);
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('W', 2, addr, val as u32, self.core_id);
-            }
-        } else if Self::is_sio_local(addr) {
-            // Pre-Stage-3 `Bus::write16` dropped SIO writes silently
-            // (region 0xD had no write16 arm). Preserve that here: drop
-            // the write, but still emit the trace line so observability
-            // is unchanged.
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('W', 2, addr, val as u32, self.core_id);
-            }
-        } else {
-            bus.write16(addr, val, self.core_id);
+
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        if !bus.begin_access(addr, 2, self.core_id, self.secure, privileged) {
+            bus.end_access(self.core_id);
+            return;
         }
+        {
+            self.counters.classify_access(addr, true);
+            // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
+            self.did_write_this_quantum = true;
+            if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+                // ARMv8-M: halfword PPB accesses are UNPREDICTABLE. We
+                // defensively RMW the matching half of the containing 32-bit
+                // register rather than faulting. Contrast bus_write8, which
+                // drops the write — byte writes to PPB are more unusual.
+                let old = self.ppb_read32(addr & !3);
+                let new_val = if addr & 2 != 0 {
+                    (old & 0x0000_FFFF) | ((val as u32) << 16)
+                } else {
+                    (old & 0xFFFF_0000) | val as u32
+                };
+                self.ppb_write32(addr & !3, new_val);
+                self.sync_nvic_to_irq_pending(addr & !3, bus);
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('W', 2, addr, val as u32, self.core_id);
+                }
+            } else if Self::is_sio_local(addr) {
+                // Pre-Stage-3 `Bus::write16` dropped SIO writes silently
+                // (region 0xD had no write16 arm). Preserve that here: drop
+                // the write, but still emit the trace line so observability
+                // is unchanged.
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('W', 2, addr, val as u32, self.core_id);
+                }
+            } else {
+                bus.write16(addr, val, self.core_id);
+            }
+        };
+        bus.end_access(self.core_id);
     }
 
     pub(crate) fn bus_read8<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u8 {
         if !self.check_data_access(addr, 1, false) {
             return 0;
         }
-        self.counters.classify_access(addr, false);
-        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            // PPB registers are word-access-only; byte reads return 0 —
-            // except the byte-accessible priority registers.
-            let val = if Self::is_byte_accessible_ppb(addr) {
-                (self.ppb_read32(addr & !3) >> ((addr & 3) * 8)) as u8
-            } else {
-                0
-            };
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('R', 1, addr, val as u32, self.core_id);
-            }
-            val
-        } else if Self::is_sio_local(addr) {
-            // Matches the pre-Stage-3 `Bus::read8` 0xD path: read the
-            // containing 32-bit SIO register and slice the byte.
-            let word = self.sio_local.read32(addr & 0xFFF & !3);
-            let byte_idx = (addr & 3) as usize;
-            let val = word.to_le_bytes()[byte_idx];
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('R', 1, addr, val as u32, self.core_id);
-            }
-            val
-        } else {
-            bus.read8(addr, self.core_id)
+
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        if !bus.begin_access(addr, 1, self.core_id, self.secure, privileged) {
+            bus.end_access(self.core_id);
+            return 0;
         }
+        let result = {
+            self.counters.classify_access(addr, false);
+            if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+                // PPB registers are word-access-only; byte reads return 0 —
+                // except the byte-accessible priority registers.
+                let val = if Self::is_byte_accessible_ppb(addr) {
+                    (self.ppb_read32(addr & !3) >> ((addr & 3) * 8)) as u8
+                } else {
+                    0
+                };
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('R', 1, addr, val as u32, self.core_id);
+                }
+                val
+            } else if Self::is_sio_local(addr) {
+                // Matches the pre-Stage-3 `Bus::read8` 0xD path: read the
+                // containing 32-bit SIO register and slice the byte.
+                let word = self.sio_local.read32(addr & 0xFFF & !3);
+                let byte_idx = (addr & 3) as usize;
+                let val = word.to_le_bytes()[byte_idx];
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('R', 1, addr, val as u32, self.core_id);
+                }
+                val
+            } else {
+                bus.read8(addr, self.core_id)
+            }
+        };
+        bus.end_access(self.core_id);
+        result
     }
 
     /// NVIC_IPRn and SCB_SHPR1-3: the PPB registers Armv8-M makes
@@ -1056,34 +1110,43 @@ impl CortexM33 {
         if !self.check_data_access(addr, 1, true) {
             return;
         }
-        self.counters.classify_access(addr, true);
-        // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
-        self.did_write_this_quantum = true;
-        if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
-            // PPB registers are word-access-only; byte writes drop —
-            // except the byte-accessible priority registers, which take
-            // the byte in their lane.
-            if Self::is_byte_accessible_ppb(addr) {
-                let shift = (addr & 3) * 8;
-                let old = self.ppb_read32(addr & !3);
-                self.ppb_write32(
-                    addr & !3,
-                    (old & !(0xFF << shift)) | ((val as u32) << shift),
-                );
-            }
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);
-            }
-        } else if Self::is_sio_local(addr) {
-            // Pre-Stage-3 `Bus::write8` dropped SIO writes silently
-            // (region 0xD had no write8 arm). Preserve that; see the
-            // matching note in `bus_write16`.
-            if bus.mmio_trace_enabled() {
-                bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);
-            }
-        } else {
-            bus.write8(addr, val, self.core_id);
+
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        if !bus.begin_access(addr, 1, self.core_id, self.secure, privileged) {
+            bus.end_access(self.core_id);
+            return;
         }
+        {
+            self.counters.classify_access(addr, true);
+            // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
+            self.did_write_this_quantum = true;
+            if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
+                // PPB registers are word-access-only; byte writes drop —
+                // except the byte-accessible priority registers, which take
+                // the byte in their lane.
+                if Self::is_byte_accessible_ppb(addr) {
+                    let shift = (addr & 3) * 8;
+                    let old = self.ppb_read32(addr & !3);
+                    self.ppb_write32(
+                        addr & !3,
+                        (old & !(0xFF << shift)) | ((val as u32) << shift),
+                    );
+                }
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);
+                }
+            } else if Self::is_sio_local(addr) {
+                // Pre-Stage-3 `Bus::write8` dropped SIO writes silently
+                // (region 0xD had no write8 arm). Preserve that; see the
+                // matching note in `bus_write16`.
+                if bus.mmio_trace_enabled() {
+                    bus.emit_mmio_trace('W', 1, addr, val as u32, self.core_id);
+                }
+            } else {
+                bus.write8(addr, val, self.core_id);
+            }
+        };
+        bus.end_access(self.core_id);
     }
 
     /// After a PPB write that may have touched NVIC_ISPR / NVIC_ICPR,

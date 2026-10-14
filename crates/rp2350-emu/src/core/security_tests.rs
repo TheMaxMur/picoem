@@ -300,3 +300,55 @@ fn corrupted_secure_integrity_signature_prevents_register_restore() {
     );
     assert_eq!(cpu.regs.ipsr(), 7);
 }
+
+#[test]
+fn real_nonsecure_loads_obey_peripheral_accessctrl_filters() {
+    for address in [
+        0x5010_0000,
+        0x5011_0000,
+        0x400f_0000,
+        0x4012_0000,
+        0x400d_0000,
+        0x4002_0000,
+        0x4001_0000,
+        0x400e_0000,
+    ] {
+        let (mut cpu, mut bus) = machine(0x6808);
+        cpu.regs.r[1] = address;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.ipsr(), 3, "NS touched a protected peripheral");
+        assert_eq!(cpu.ppb.bfar, address);
+    }
+}
+
+#[test]
+fn nonsecure_cpu_cannot_grant_itself_usb_access() {
+    let (mut cpu, mut bus) = machine(0x6008);
+    cpu.regs.r[1] = 0x4006_0048;
+    cpu.regs.r[0] = 0xacce_00ff;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.ipsr(), 0);
+    assert_eq!(bus.read32(0x4006_0048, 0), 0xfc);
+}
+
+#[test]
+fn secure_grant_allows_real_nonsecure_usb_access() {
+    let (mut cpu, mut bus) = machine(0x6808);
+    bus.write32(0x4006_0048, 0xacce_001a, 0);
+    cpu.regs.r[1] = 0x5011_0000;
+    cpu.step(&mut bus);
+    assert_eq!(cpu.regs.ipsr(), 0);
+    assert!(!cpu.secure);
+}
+
+#[test]
+fn nonsecure_rom_hooks_obey_bus_permissions() {
+    let (mut cpu, mut bus) = machine(0xbf00);
+    cpu.bootrom_reboot_hook_pc_ns = Some(0x5000);
+    cpu.regs.set_pc(0x5000);
+    bus.write32(0x4006_0014, 0xacce_0038, 0);
+    cpu.step(&mut bus);
+    assert!(!cpu.bootrom_hook_fired, "ROM hook bypassed ACCESSCTRL");
+    assert_eq!(cpu.regs.ipsr(), 3);
+    assert_eq!(cpu.ppb.bfar, 0x5000);
+}

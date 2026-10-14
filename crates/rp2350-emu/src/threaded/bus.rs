@@ -1166,9 +1166,36 @@ impl WorkerBus {
 // =======================================================================
 
 impl CoreBus for WorkerBus {
+    fn begin_access(
+        &mut self,
+        addr: u32,
+        size: u32,
+        core: u8,
+        secure: bool,
+        privileged: bool,
+    ) -> bool {
+        let mut policy = self.shared.accessctrl.lock().unwrap();
+        let access = crate::bus::accessctrl::Access::core(core, secure, privileged);
+        policy.contexts[core as usize] = policy.effective(access);
+        if !policy.permitted(addr, access) || !policy.permitted(addr.wrapping_add(size - 1), access)
+        {
+            self.shared.atomics.set_bus_fault(core as usize, addr);
+            return false;
+        }
+        true
+    }
+
+    fn end_access(&mut self, core: u8) {
+        self.shared.accessctrl.lock().unwrap().contexts[core as usize] =
+            crate::bus::accessctrl::Access::debugger();
+    }
+
     // --- Canonical 13-method surface --------------------------------
 
     fn read8(&mut self, addr: u32, core: u8) -> u8 {
+        if crate::bus::accessctrl::AccessCtrl::owns(addr) {
+            return (self.shared.accessctrl.lock().unwrap().read(addr) >> ((addr & 3) * 8)) as u8;
+        }
         // Boot RAM (0xEFFF_F000..0xF000_0000) and XIP SRAM
         // (0x1C00_0000..0x1C00_4000) live at addresses the generic
         // `0x0..=0x2` arm would either miss (boot RAM is 0xE) or
@@ -1212,6 +1239,9 @@ impl CoreBus for WorkerBus {
     }
 
     fn read16(&mut self, addr: u32, core: u8) -> u16 {
+        if crate::bus::accessctrl::AccessCtrl::owns(addr) {
+            return (self.shared.accessctrl.lock().unwrap().read(addr) >> ((addr & 2) * 8)) as u16;
+        }
         if is_boot_ram_addr(addr) {
             return self.shared.memory.read_boot_ram16(addr);
         }
@@ -1248,6 +1278,9 @@ impl CoreBus for WorkerBus {
     }
 
     fn read32(&mut self, addr: u32, core: u8) -> u32 {
+        if crate::bus::accessctrl::AccessCtrl::owns(addr) {
+            return self.shared.accessctrl.lock().unwrap().read(addr);
+        }
         if is_boot_ram_addr(addr) {
             return self.shared.memory.read_boot_ram32(addr);
         }
@@ -1270,6 +1303,16 @@ impl CoreBus for WorkerBus {
     /// `shared.memory.cas32` + `shared.monitors.snoop` directly per
     /// LLD V7 §4.
     fn write8(&mut self, addr: u32, val: u8, core: u8) {
+        if crate::bus::accessctrl::AccessCtrl::owns(addr) {
+            let mut policy = self.shared.accessctrl.lock().unwrap();
+            let access = policy.contexts[core as usize];
+            if policy.write(addr, u32::from(val) * 0x0101_0101, access)
+                == crate::bus::accessctrl::Write::BusError
+            {
+                self.shared.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
         if is_boot_ram_addr(addr) {
             self.shared.memory.write_boot_ram8(addr, val);
             self.shared.monitors.snoop(addr);
@@ -1344,6 +1387,16 @@ impl CoreBus for WorkerBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16, core: u8) {
+        if crate::bus::accessctrl::AccessCtrl::owns(addr) {
+            let mut policy = self.shared.accessctrl.lock().unwrap();
+            let access = policy.contexts[core as usize];
+            if policy.write(addr, u32::from(val) * 0x0001_0001, access)
+                == crate::bus::accessctrl::Write::BusError
+            {
+                self.shared.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
         if is_boot_ram_addr(addr) {
             self.shared.memory.write_boot_ram16(addr, val);
             self.shared.monitors.snoop(addr);
@@ -1408,6 +1461,14 @@ impl CoreBus for WorkerBus {
     /// `shared.memory.cas32` + `shared.monitors.snoop` directly per
     /// LLD V7 §4.
     fn write32(&mut self, addr: u32, val: u32, core: u8) {
+        if crate::bus::accessctrl::AccessCtrl::owns(addr) {
+            let mut policy = self.shared.accessctrl.lock().unwrap();
+            let access = policy.contexts[core as usize];
+            if policy.write(addr, val, access) == crate::bus::accessctrl::Write::BusError {
+                self.shared.atomics.set_bus_fault(core as usize, addr);
+            }
+            return;
+        }
         if is_boot_ram_addr(addr) {
             self.shared.memory.write_boot_ram32(addr, val);
             self.shared.monitors.snoop(addr);

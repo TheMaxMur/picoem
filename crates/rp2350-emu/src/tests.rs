@@ -5363,7 +5363,7 @@ fn bus_latency_sio_access_1_cycle() {
 fn atomic_alias_normal_write() {
     // Base+0x0000: normal write replaces the value.
     let (_, mut bus) = core_and_bus();
-    let base = 0x4006_0000; // APB peripheral base (generic, not a stub peripheral)
+    let base = 0x4017_0000; // APB peripheral base (reserved test-only register)
     bus.write32(base, 0xFF00_FF00, 0);
     assert_eq!(bus.read32(base, 0), 0xFF00_FF00);
 }
@@ -5372,7 +5372,7 @@ fn atomic_alias_normal_write() {
 fn atomic_alias_xor_write() {
     // Base+0x1000: XOR — new_val = old_val ^ written_val.
     let (_, mut bus) = core_and_bus();
-    let base = 0x4006_0000;
+    let base = 0x4017_0000;
     bus.write32(base, 0xFF00_FF00, 0); // seed value
     bus.write32(base + 0x1000, 0x0F0F_0F0F, 0); // XOR alias
     assert_eq!(bus.read32(base, 0), 0xF00F_F00F);
@@ -5382,7 +5382,7 @@ fn atomic_alias_xor_write() {
 fn atomic_alias_set_write() {
     // Base+0x2000: SET — new_val = old_val | written_val.
     let (_, mut bus) = core_and_bus();
-    let base = 0x4006_0000;
+    let base = 0x4017_0000;
     bus.write32(base, 0x0000_00FF, 0); // seed value
     bus.write32(base + 0x2000, 0x0000_FF00, 0); // SET alias
     assert_eq!(bus.read32(base, 0), 0x0000_FFFF);
@@ -5392,7 +5392,7 @@ fn atomic_alias_set_write() {
 fn atomic_alias_clr_write() {
     // Base+0x3000: CLR — new_val = old_val & ~written_val.
     let (_, mut bus) = core_and_bus();
-    let base = 0x4006_0000;
+    let base = 0x4017_0000;
     bus.write32(base, 0xFFFF_FFFF, 0); // seed value
     bus.write32(base + 0x3000, 0x00FF_00FF, 0); // CLR alias
     assert_eq!(bus.read32(base, 0), 0xFF00_FF00);
@@ -5402,7 +5402,7 @@ fn atomic_alias_clr_write() {
 fn atomic_alias_read_ignores_alias_bits() {
     // Reads from any alias offset return the same canonical value.
     let (_, mut bus) = core_and_bus();
-    let base = 0x4006_0000;
+    let base = 0x4017_0000;
     bus.write32(base, 0xBEEF_CAFE, 0);
     assert_eq!(bus.read32(base, 0), 0xBEEF_CAFE);
     assert_eq!(bus.read32(base + 0x1000, 0), 0xBEEF_CAFE); // XOR alias read

@@ -246,6 +246,19 @@ impl CortexM33 {
     /// semantics to pre-cache behaviour.
     pub(crate) fn decode_execute<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         let pc = self.regs.pc();
+        let privileged = self.regs.in_handler_mode() || self.regs.control & 1 == 0;
+        self.current_instr_addr = pc;
+        if !bus.begin_access(pc, 2, self.core_id, self.secure, privileged) {
+            bus.end_access(self.core_id);
+            return 1;
+        }
+        let result = self.decode_execute_access(bus);
+        bus.end_access(self.core_id);
+        result
+    }
+
+    fn decode_execute_access<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
+        let pc = self.regs.pc();
         self.current_instr_addr = pc;
         // Attribution is checked even on a decode-cache hit.
         if !self.check_fetch(pc, 2, bus) {

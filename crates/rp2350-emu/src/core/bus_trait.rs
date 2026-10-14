@@ -39,6 +39,16 @@ use std::sync::Arc;
 use crate::threaded::CoreAtomics;
 
 pub trait CoreBus {
+    fn begin_access(
+        &mut self,
+        addr: u32,
+        size: u32,
+        core: u8,
+        secure: bool,
+        privileged: bool,
+    ) -> bool;
+    fn end_access(&mut self, core: u8);
+
     // --- Canonical 13-method surface (LLD V7 §1) ----------------------
 
     fn read8(&mut self, addr: u32, core: u8) -> u8;
