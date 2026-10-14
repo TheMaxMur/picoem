@@ -247,6 +247,10 @@ impl CortexM33 {
     pub(crate) fn decode_execute<B: CoreBus>(&mut self, bus: &mut B) -> u32 {
         let pc = self.regs.pc();
         self.current_instr_addr = pc;
+        // Attribution is checked even on a decode-cache hit.
+        if !self.check_fetch(pc, 2, bus) {
+            return 1;
+        }
         // Publish the instruction PC on the bus so the MMIO trace
         // (HLD V5 §4.2.7) can report it for every access this
         // instruction performs. Set before the fetch so the I-fetch
@@ -281,6 +285,9 @@ impl CortexM33 {
         let hw0 = entry.hw0;
         let hw1 = entry.hw1;
         let is_wide = entry.is_wide();
+        if is_wide && !self.check_fetch(pc, 4, bus) {
+            return 1;
+        }
         let is_pure = entry.is_pure();
         let flag_only = entry.is_flag_only();
 

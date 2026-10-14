@@ -164,8 +164,10 @@ pub struct Ppb {
     pub hfsr: u32,      // Hard Fault Status (0xE000ED2C)
     pub mmfar: u32,     // MemManage Fault Address (0xE000ED34)
     pub bfar: u32,      // Bus Fault Address (0xE000ED38)
-    pub cpacr: u32,     // Coprocessor Access Control (0xE000ED88)
-    pub icsr: u32,      // Interrupt Control/State (0xE000ED04)
+    pub sfsr: u32,
+    pub sfar: u32,
+    pub cpacr: u32, // Coprocessor Access Control (0xE000ED88)
+    pub icsr: u32,  // Interrupt Control/State (0xE000ED04)
 
     // FP extension registers (Phase 7 Stage B — DDI0553 §D1.2.32-34)
     //
@@ -289,6 +291,8 @@ impl Default for Ppb {
             hfsr: 0,
             mmfar: 0,
             bfar: 0,
+            sfsr: 0,
+            sfar: 0,
             cpacr: 0x00F0_0000, // CP10/11 (FPU) full access
             icsr: 0,
             // ASPEN=1 (auto FP context save), LSPEN=1 (lazy enabled).
@@ -436,6 +440,9 @@ impl Ppb {
 
             // BFAR
             0xED38 => self.bfar,
+
+            0xEDE4 => self.sfsr,
+            0xEDE8 => self.sfar,
 
             // CPACR
             0xED88 => self.cpacr,
@@ -635,6 +642,9 @@ impl Ppb {
 
             // BFAR
             0xED38 => self.bfar = val,
+
+            0xEDE4 => self.sfsr &= !val,
+            0xEDE8 => self.sfar = val,
 
             // CPACR
             0xED88 => self.cpacr = val,

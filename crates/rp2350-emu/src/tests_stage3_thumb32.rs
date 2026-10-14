@@ -2745,6 +2745,9 @@ mod more_coverage {
     #[test]
     fn sg_from_nonsecure() {
         let mut c = CortexM33::for_test(0);
+        c.ppb.sau_ctrl = 1;
+        c.ppb.sau_regions[0] = (0x2007_0000, 0x2007_001f | 3);
+        c.regs.set_pc(0x2007_0000);
         c.secure = false;
         c.regs.set_lr(0x1234_5679);
         c.execute_one_wide(0xE97F, 0xE97F);
@@ -4617,6 +4620,8 @@ mod worker_bus_exec {
         pc += 0x100;
 
         // SG Non-Secure (line 681/682)
+        c.ppb.sau_ctrl = 1;
+        c.ppb.sau_regions[0] = (pc & !0x1f, pc | 0x1f | 3);
         c.secure = false;
         run_wide(&mut c, &mut bus, pc, 0xE97Fu16, 0xE97Fu16);
         pc += 0x100;

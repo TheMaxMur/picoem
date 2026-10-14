@@ -836,6 +836,14 @@ impl CortexM33 {
     /// Deliver a pending fault. Returns cycle cost.
     pub(crate) fn deliver_fault<B: CoreBus>(&mut self, fault: Fault, bus: &mut B) -> u32 {
         match fault {
+            Fault::SecureFault => {
+                if self.ppb.shcsr & (1 << 19) != 0 {
+                    self.enter_exception(7, bus)
+                } else {
+                    self.ppb.hfsr |= 1 << 30;
+                    self.enter_exception(3, bus)
+                }
+            }
             Fault::UsageFault => {
                 // Set UFSR.UNDEFINSTR (bit 16 of CFSR)
                 self.ppb.cfsr |= 1 << 16;
@@ -852,19 +860,19 @@ impl CortexM33 {
                 }
             }
             Fault::MemManage => {
-                // Set MMFSR.DACCVIOL (bit 1 of CFSR). Data-side is the honest default:
-                // Phase 7 Stage E's MPU-fault-during-lazy-flush use case is data-side.
-                self.ppb.cfsr |= 1 << 1;
-                if self.ppb.shcsr & (1 << 16) != 0 {
-                    // MEMFAULTENA
+                let (status, enable) = if self.secure {
+                    (&mut self.ppb.cfsr, self.ppb.shcsr)
+                } else {
+                    (&mut self.ppb.ns.cfsr, self.ppb.ns.shcsr)
+                };
+                if *status & 3 == 0 {
+                    *status |= 1 << 1;
+                }
+                if enable & (1 << 16) != 0 {
                     self.enter_exception(4, bus)
                 } else {
-                    info!(
-                        pc = format_args!("{:#010x}", self.current_instr_addr),
-                        "HardFault escalation from MemManage",
-                    );
-                    self.ppb.hfsr |= 1 << 30; // FORCED
-                    self.enter_exception(3, bus) // escalate to HardFault
+                    self.ppb.hfsr |= 1 << 30;
+                    self.enter_exception(3, bus)
                 }
             }
             // NMI (exception #2) has priority -2. ARMv8-M §B3.4.1 escalation:
@@ -957,7 +965,12 @@ impl CortexM33 {
     /// region that matches wins (the bootrom's MPU self-test relies on
     /// it). No match: the default memory map for privileged code when
     /// PRIVDEFENA is set, no access otherwise; MPU off: the default map.
-    fn mpu_access(&self, addr: u32, ns_mpu: bool, unpriv: bool) -> (bool, bool, Option<u8>) {
+    pub(crate) fn mpu_access(
+        &self,
+        addr: u32,
+        ns_mpu: bool,
+        unpriv: bool,
+    ) -> (bool, bool, Option<u8>) {
         let (ctrl, regions) = if ns_mpu {
             (self.ppb.ns.mpu_ctrl, &self.ppb.ns.mpu_regions)
         } else {

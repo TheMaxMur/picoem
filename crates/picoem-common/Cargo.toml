@@ -2,7 +2,7 @@
 name = "picoem-common"
 version = "0.2.2"
 edition.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only"
 rust-version.workspace = true
 description = "Shared primitives for the picoem RP2350/RP2040 emulator workspace: Memory, ClockTree, Pacer, PIO building blocks, threading helpers."
 repository = "https://github.com/0x4D44/picoem"

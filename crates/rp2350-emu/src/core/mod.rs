@@ -9,6 +9,7 @@ mod execute_fpu;
 pub(crate) mod execute_fpu;
 pub(crate) mod execute_thumb32;
 pub mod registers;
+mod security;
 
 use std::sync::Arc;
 
@@ -190,6 +191,7 @@ impl PerCoreSio {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Fault {
     UsageFault,
+    SecureFault,
     // Constructed by:
     //   * Phase 7 Stage B — lazy-FP flush fault when the FP frame's
     //     destination page is unmapped by the MPU.
@@ -486,6 +488,13 @@ impl CortexM33 {
         // the quantum boundary and propagates `shutdown_requested` on
         // the `Emulator`.
         let pc = self.regs.pc();
+        if pc < ROM_HOOK_PC_END && !self.check_fetch(pc, 2, bus) {
+            if let Some(fault) = self.pending_fault.take() {
+                let cost = self.deliver_fault(fault, bus);
+                self.cycles = self.cycles.wrapping_add(cost as u64);
+            }
+            return;
+        }
         if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
             self.bootrom_hook_fired = true;
             self.atomics.set_halted(core);
@@ -577,6 +586,13 @@ impl CortexM33 {
         // Bootrom mask-ROM hook — same shape as `Self::step`, see HLD
         // V5 §"Component 3 — Bootrom mask-ROM" / "Hook check placement".
         let pc = self.regs.pc();
+        if pc < ROM_HOOK_PC_END && !self.check_fetch(pc, 2, bus) {
+            if let Some(fault) = self.pending_fault.take() {
+                let cost = self.deliver_fault(fault, bus);
+                self.cycles = self.cycles.wrapping_add(cost as u64);
+            }
+            return;
+        }
         if Some(pc) == self.bootrom_reboot_hook_pc_s || Some(pc) == self.bootrom_reboot_hook_pc_ns {
             self.bootrom_hook_fired = true;
             self.atomics.set_halted(self.core_id as usize);
@@ -872,6 +888,9 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_read32<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u32 {
+        if !self.check_data_access(addr, 4, false) {
+            return 0;
+        }
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             let val = self.ppb_read32(addr);
@@ -891,6 +910,9 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write32<B: CoreBus>(&mut self, addr: u32, val: u32, bus: &mut B) {
+        if !self.check_data_access(addr, 4, true) {
+            return;
+        }
         self.counters.classify_access(addr, true);
         // Phase 0b.2: any data-side write invalidates a peer core's
         // exclusive monitor. `Emulator::step` snoops this flag after the
@@ -913,6 +935,9 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_read16<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u16 {
+        if !self.check_data_access(addr, 2, false) {
+            return 0;
+        }
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // ARMv8-M: halfword PPB accesses are UNPREDICTABLE (word-only
@@ -950,6 +975,9 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write16<B: CoreBus>(&mut self, addr: u32, val: u16, bus: &mut B) {
+        if !self.check_data_access(addr, 2, true) {
+            return;
+        }
         self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
@@ -983,6 +1011,9 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_read8<B: CoreBus>(&mut self, addr: u32, bus: &mut B) -> u8 {
+        if !self.check_data_access(addr, 1, false) {
+            return 0;
+        }
         self.counters.classify_access(addr, false);
         if addr >> 28 == 0xE && !Bus::is_boot_ram(addr) {
             // PPB registers are word-access-only; byte reads return 0 —
@@ -1022,6 +1053,9 @@ impl CortexM33 {
     }
 
     pub(crate) fn bus_write8<B: CoreBus>(&mut self, addr: u32, val: u8, bus: &mut B) {
+        if !self.check_data_access(addr, 1, true) {
+            return;
+        }
         self.counters.classify_access(addr, true);
         // Phase 0b.2: see `bus_write32` for the monitor-invalidation rationale.
         self.did_write_this_quantum = true;
@@ -1487,3 +1521,7 @@ mod tests {
         assert_eq!(core.bus_read32(0xD000_0080, &mut bus), 0xCAFE_F00D);
     }
 }
+
+#[cfg(test)]
+#[path = "security_tests.rs"]
+mod security_tests;

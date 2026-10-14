@@ -759,6 +759,10 @@ impl CortexM33 {
         // LR bit 0 to mark the return address as Non-Secure.
         if hw0 == 0xE97F && hw1 == 0xE97F {
             if !self.secure {
+                if !self.security_attribution(self.current_instr_addr).nsc {
+                    self.security_fault(self.current_instr_addr, 1); // SFSR.INVEP.
+                    return 1;
+                }
                 self.transition_to_secure();
                 // Clear bit 0 of LR to mark return address as NS.
                 let lr = self.regs.lr() & !1;

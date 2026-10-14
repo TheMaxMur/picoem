@@ -2,7 +2,7 @@
 name = "rp2350-emu"
 version = "0.2.6"
 edition.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only"
 rust-version.workspace = true
 description = "Cycle-accurate emulator for the Raspberry Pi RP2350 / RP2354 (dual Cortex-M33 + PIO + FPU)."
 repository = "https://github.com/0x4D44/picoem"

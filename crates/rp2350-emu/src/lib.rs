@@ -2556,6 +2556,7 @@ mod stage5_lib_residue {
         c.regs.r[0] = 0xE000_ED08;
         c.regs.r[1] = 0x2000_4000;
         c.regs.set_pc(0x2000_0000);
+        c.ppb.sau_ctrl = 2; // Bank-switch fixtures use all-NS attribution.
         c.transition_to_nonsecure();
         emu.step().unwrap();
         let c = emu.core(0);
@@ -2588,6 +2589,7 @@ mod stage5_lib_residue {
         c.regs.r[1] = 0x2000_0000;
         c.regs.r[2] = 0xFFFF_FFFF;
         c.regs.set_pc(0x2000_0000);
+        c.ppb.sau_ctrl = 2; // Bank-switch fixtures use all-NS attribution.
         c.transition_to_nonsecure();
         emu.step().unwrap();
         let c = emu.core(0);
@@ -2616,6 +2618,7 @@ mod stage5_lib_residue {
         m.sram_write32(0x400 + 4 * (16 + 3), 0x2000_0181);
         emu.core_mut(1).halt();
         let c = emu.core_mut(0);
+        c.ppb.sau_ctrl = 2; // Attribution is independent of IRQ target state.
         c.ppb.vtor = 0x2000_0200;
         c.ppb.ns.vtor = 0x2000_0400;
         c.regs.msp = 0x2000_1000;
