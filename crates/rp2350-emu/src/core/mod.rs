@@ -813,6 +813,11 @@ impl CortexM33 {
         self.atomics.clear_halted(self.core_id as usize);
     }
 
+    /// Whether the active register bank belongs to Secure state.
+    pub fn is_secure(&self) -> bool {
+        self.secure
+    }
+
     /// Returns `true` if the core is halted.
     pub fn is_halted(&self) -> bool {
         self.atomics.is_halted(self.core_id as usize)
