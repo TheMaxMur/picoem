@@ -1,7 +1,7 @@
 //! RP2350 I2C peripheral (Synopsys DW_apb_i2c; datasheet §12.3).
 //!
 //! Phase 2 of the RP2350 peripheral coverage plan (HLD V5 §6 row 2).
-//! I2C0 lives at `0x4009_0000`, I2C1 at `0x4009_4000`.
+//! I2C0 lives at `0x4009_0000`, I2C1 at `0x4009_8000`.
 //!
 //! Mirrors the RP2040 I2C (`rp2040_emu::peripherals::i2c`) verbatim. The
 //! only RP2350 deltas are the NVIC IRQ number
@@ -13,12 +13,16 @@
 //! For V5 scope, this emulator NACKs every address by default
 //! (`ALWAYS_ACK_ADDRS` is empty) -- the corpus `bus_scan` scenario
 //! expects NACK-everything behaviour and the runner validates via
-//! `IC_RAW_INTR_STAT.TX_ABRT` (the latching indicator; note that
-//! `IC_TX_ABRT_SOURCE` is transient and auto-cleared by STOP). If
+//! `IC_RAW_INTR_STAT.TX_ABRT` and `IC_TX_ABRT_SOURCE` (both retained
+//! until an explicit interrupt-clear read). If
 //! scenarios later require at-least-one-slave, extend
 //! `ALWAYS_ACK_ADDRS` with the specific address(es).
 
 use std::collections::VecDeque;
+
+#[cfg(test)]
+#[path = "i2c_nack_tests.rs"]
+mod nack_tests;
 
 use picoem_common::clocks::ClockTree;
 
@@ -27,8 +31,8 @@ use crate::irq::IRQ_I2C0_IRQ;
 
 /// I2C0 base (RP2350 datasheet §12.3).
 pub const I2C0_BASE: u32 = 0x4009_0000;
-/// I2C1 base (RP2350 datasheet §12.3, 4 KB stride).
-pub const I2C1_BASE: u32 = 0x4009_4000;
+/// I2C1 base (RP2350 datasheet §12.3, 32 KB stride).
+pub const I2C1_BASE: u32 = 0x4009_8000;
 
 pub const IC_CON: u32 = 0x00;
 pub const IC_TAR: u32 = 0x04;
@@ -111,9 +115,8 @@ pub const I2C_FIFO_DEPTH: usize = 16;
 
 /// TX_ABRT reason bit for master abort (no ACK from 7-bit slave).
 const ABRT_7B_ADDR_NOACK: u32 = 1 << 0;
-/// TX_ABRT reason bit for 10-bit master abort (repurposed as
-/// "unsupported 10-bit addressing").
-const ABRT_10ADDR1_NOACK: u32 = 1 << 2;
+/// TX_ABRT reason bit when the first 10-bit address byte is not acknowledged.
+const ABRT_10ADDR1_NOACK: u32 = 1 << 1;
 
 pub struct I2cRegs {
     con: u32,
@@ -193,7 +196,7 @@ impl I2cRegs {
         self.dreq_rx
     }
 
-    /// True iff FIFOs empty, no sticky interrupts, bus inactive.
+    /// True iff FIFOs are empty and no interrupt status needs servicing.
     pub fn is_idle(&self) -> bool {
         self.tx_fifo.is_empty() && self.rx_fifo.is_empty() && self.raw_intr_stat == 0
     }
@@ -255,7 +258,7 @@ impl I2cRegs {
         let is_read = (cmd & DATA_CMD_READ) != 0;
 
         if !ack {
-            self.raw_intr_stat |= INT_TX_ABRT;
+            self.raw_intr_stat |= INT_TX_ABRT | INT_TX_EMPTY;
             if ten_bit {
                 self.tx_abrt_source |= ABRT_10ADDR1_NOACK;
             } else {
@@ -279,11 +282,6 @@ impl I2cRegs {
         if (cmd & DATA_CMD_STOP) != 0 || !ack {
             self.raw_intr_stat |= INT_STOP_DET;
             self.activity = false;
-            // DW_apb_i2c auto-clears the abort source register when the
-            // bus returns to idle after STOP. The snapshot is transient --
-            // only valid while IC_RAW_INTR_STAT.TX_ABRT is asserted.
-            // Once STOP completes, silicon clears it.
-            self.tx_abrt_source = 0;
         }
         self.route_irq(irqs);
     }
@@ -447,6 +445,7 @@ impl I2cRegs {
                     self.tx_fifo.clear();
                     self.rx_fifo.clear();
                     self.activity = false;
+                    self.raw_intr_stat &= !INT_TX_EMPTY;
                 }
             }
             IC_SDA_HOLD => {
@@ -551,12 +550,9 @@ mod tests {
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
         // Issue a dummy read-with-stop.
         i.write32(IC_DATA_CMD, DATA_CMD_READ | DATA_CMD_STOP, 0, &mut irqs);
-        // IC_RAW_INTR_STAT.TX_ABRT latches until explicitly cleared --
-        // this is the durable abort indicator. IC_TX_ABRT_SOURCE is
-        // transient and auto-cleared by STOP (matching DW_apb_i2c
-        // silicon behaviour).
+        // STOP does not acknowledge the abort interrupt or its cause.
         assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
-        assert_eq!(i.tx_abrt_source, 0, "auto-cleared by STOP");
+        assert_eq!(i.tx_abrt_source, ABRT_7B_ADDR_NOACK);
         assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
     }
 
@@ -597,9 +593,8 @@ mod tests {
         i.write32(IC_TAR, 0x3C, 0, &mut irqs);
         i.write32(IC_ENABLE, 1, 0, &mut irqs);
         i.write32(IC_DATA_CMD, DATA_CMD_STOP, 0, &mut irqs);
-        // tx_abrt_source is auto-cleared by STOP; check the latching
-        // RAW_INTR_STAT.TX_ABRT instead.
         assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_eq!(i.tx_abrt_source, ABRT_10ADDR1_NOACK);
     }
 
     /// I2C1 constructs with distinct IRQ/DREQ wiring from I2C0. Smoke
@@ -662,9 +657,7 @@ mod tests {
         assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
         // No STOP bit was set, but `!ack` also asserts STOP_DET (line 279).
         assert_ne!(i.raw_intr_stat & INT_STOP_DET, 0);
-        // 7-bit address path: ABRT_7B_ADDR_NOACK *was* set during the
-        // transaction but auto-cleared once STOP completed.
-        assert_eq!(i.tx_abrt_source, 0);
+        assert_eq!(i.tx_abrt_source, ABRT_7B_ADDR_NOACK);
     }
 
     /// IC_DATA_CMD: write-with-RESTART (no STOP, no CMD/READ). Same NACK
@@ -1089,16 +1082,7 @@ mod tests {
         assert_eq!(irqs, original);
     }
 
-    /// IC_TX_ABRT_SOURCE for 10-bit-master path: assert
-    /// ABRT_10ADDR1_NOACK is set transiently before STOP. We use a
-    /// command WITHOUT DATA_CMD_STOP and observe the source before
-    /// STOP auto-clears it. Covers line 260 (the `if ten_bit` true
-    /// arm). The default IC_CON write doesn't propagate STOP either
-    /// because !ack also asserts STOP; so we must inspect within the
-    /// transaction. Simpler approach: read state right after the
-    /// write; auto-clear *will* have happened, but the path was
-    /// taken (verified by lack of ABRT_7B_ADDR_NOACK). The TX_ABRT
-    /// raw bit latches and is the durable indicator.
+    /// The first address NACK in 10-bit mode has its own retained cause.
     #[test]
     fn ten_bit_addressing_takes_ten_bit_arm() {
         let mut i = i0();
@@ -1109,6 +1093,7 @@ mod tests {
         i.write32(IC_DATA_CMD, 0xAA, 0, &mut irqs);
         // Latching indicator: TX_ABRT raw bit is set.
         assert_ne!(i.raw_intr_stat & INT_TX_ABRT, 0);
+        assert_eq!(i.tx_abrt_source, ABRT_10ADDR1_NOACK);
     }
 
     /// IC_SAR is writable regardless of enable state.

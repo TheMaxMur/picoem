@@ -23,6 +23,7 @@
 //! the normalised alias argument already threaded through `Bus::write32`.
 
 pub mod adc;
+
 pub mod coresight_trace;
 pub mod i2c;
 pub mod inert;
@@ -32,6 +33,9 @@ pub mod pads_bank0;
 pub mod powman;
 pub mod psm;
 pub mod pwm;
+#[cfg(test)]
+#[path = "secondary_apb_tests.rs"]
+mod secondary_apb_tests;
 pub mod sha256;
 pub mod spi;
 pub mod ticks;

@@ -14813,9 +14813,7 @@ mod stage2_i2c_coverage {
         assert!(!i.rx_dreq()); // RX empty → false.
     }
 
-    // 10-bit addressing branch in simulate_transaction. Since NACK
-    // auto-clears tx_abrt_source at the end of the transaction (STOP or
-    // !ack path), we can only observe the raw-int-stat aftermath.
+    // The abort interrupt and its reason both survive the generated STOP.
     #[test]
     fn ten_bit_noack_raises_tx_abrt_via_10addr1_path() {
         let mut i = new_i2c();
@@ -14828,6 +14826,7 @@ mod stage2_i2c_coverage {
         // RAW_INTR_STAT.TX_ABRT must latch.
         i.write32(IC_DATA_CMD, 1 << 9 /* STOP */, 0, &mut irqs);
         assert_ne!(i.read32(IC_RAW_INTR_STAT) & INT_TX_ABRT, 0);
+        assert_eq!(i.read32(IC_TX_ABRT_SOURCE), 2);
     }
 
     // ACK path — since ALWAYS_ACK_ADDRS is empty we cannot hit ack==true,
@@ -26403,7 +26402,7 @@ mod stage3_bus_residue {
     fn spi1_held_in_reset_narrow_reads_return_zero() {
         let mut bus = Bus::new();
         // SPI1 is held post-bootrom — narrow-DR reads are quiesced.
-        let sspdr = 0x4009_8000u32 + 0x008; // SPI1_BASE + SSPDR
+        let sspdr = crate::peripherals::spi::SPI1_BASE + 0x008; // SSPDR
         assert_eq!(bus.read8(sspdr, 0), 0);
         assert_eq!(bus.read16(sspdr, 0), 0);
         // Narrow writes drop silently — the bus has no observable state
@@ -26828,11 +26827,7 @@ mod stage3_io_peripherals_residue {
         );
     }
 
-    /// 7-bit address NACK sets the latching `INT_TX_ABRT` raw bit; the
-    /// transient `IC_TX_ABRT_SOURCE` is auto-cleared because `!ack`
-    /// triggers the STOP-equivalent cleanup in `simulate_transaction`.
-    /// `IC_CLR_TX_ABRT` is the explicit clear-arm — read returns 0 and
-    /// the latched raw bit clears.
+    /// Reading `IC_CLR_TX_ABRT` clears both the NACK interrupt and its cause.
     #[test]
     fn i2c_clr_tx_abrt_arm_via_register_dispatch() {
         let mut i = new_i2c();
@@ -26842,17 +26837,14 @@ mod stage3_io_peripherals_residue {
         i.write32(i2c_p::IC_DATA_CMD, 0, 0, &mut irqs);
         // Latched raw TX_ABRT bit persists.
         assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT) & i2c_p::INT_TX_ABRT, 0);
+        assert_eq!(i.read32(i2c_p::IC_TX_ABRT_SOURCE), 1);
         // Read IC_CLR_TX_ABRT — returns 0, clears both.
         assert_eq!(i.read32(i2c_p::IC_CLR_TX_ABRT), 0);
         assert_eq!(i.read32(i2c_p::IC_RAW_INTR_STAT) & i2c_p::INT_TX_ABRT, 0);
         assert_eq!(i.read32(i2c_p::IC_TX_ABRT_SOURCE), 0);
     }
 
-    /// 10-bit master mode runs through the `ten_bit` true arm in
-    /// `simulate_transaction`. The source register is auto-cleared by
-    /// the `!ack` STOP-equivalent path, so we observe the durable
-    /// `INT_TX_ABRT` latch. Distinguishes the 10-bit code path from the
-    /// 7-bit path which the existing `nack_default_for_bus_scan` covers.
+    /// A 10-bit first-address NACK has a distinct interrupt cause.
     #[test]
     fn i2c_10bit_addressing_path_latches_tx_abrt() {
         let mut i = new_i2c();
@@ -26869,6 +26861,7 @@ mod stage3_io_peripherals_residue {
         i.write32(i2c_p::IC_DATA_CMD, 0, 0, &mut irqs);
         // Latched TX_ABRT raw bit confirms the 10-bit path executed.
         assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT) & i2c_p::INT_TX_ABRT, 0);
+        assert_eq!(i.read32(i2c_p::IC_TX_ABRT_SOURCE), 2);
     }
 
     /// IC_CLR_INTR (W1C bulk-clear) returns 0 and clears all auto-clear
@@ -26882,10 +26875,8 @@ mod stage3_io_peripherals_residue {
         i.write32(i2c_p::IC_DATA_CMD, 1u32 << 9, 0, &mut irqs);
         assert_ne!(i.read32(i2c_p::IC_RAW_INTR_STAT), 0);
         assert_eq!(i.read32(i2c_p::IC_CLR_INTR), 0);
-        // INT_RX_FULL is the only bit not auto-cleared by IC_CLR_INTR;
-        // since the bus_scan-style transaction NACKs (no rx push), all
-        // auto-clear bits should be gone.
-        assert_eq!(i.read32(i2c_p::IC_RAW_INTR_STAT), 0);
+        // TX_EMPTY is a FIFO level, not a clearable interrupt latch.
+        assert_eq!(i.read32(i2c_p::IC_RAW_INTR_STAT), i2c_p::INT_TX_EMPTY);
     }
 
     /// Each individual `IC_CLR_*` arm: read returns 0, raw bit cleared.
@@ -27064,8 +27055,7 @@ mod stage3_io_peripherals_residue {
         assert_eq!(i.read32(0xABC), 0);
     }
 
-    /// `is_idle` is false once a NACK latches abort bits; clearing
-    /// returns it to true. Locks in both arms of the predicate.
+    /// Pending aborts and FIFO-level interrupts both need servicing.
     #[test]
     fn i2c_is_idle_arms() {
         let mut i = new_i2c();
@@ -27076,6 +27066,11 @@ mod stage3_io_peripherals_residue {
         i.write32(i2c_p::IC_DATA_CMD, 1 << 9, 0, &mut irqs); // STOP-included
         assert!(!i.is_idle(), "raw_intr_stat latches even after STOP");
         let _ = i.read32(i2c_p::IC_CLR_INTR);
+        assert!(
+            !i.is_idle(),
+            "TX_EMPTY remains until the idle controller is disabled"
+        );
+        i.write32(i2c_p::IC_ENABLE, 0, 0, &mut irqs);
         assert!(i.is_idle());
     }
 

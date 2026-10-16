@@ -4,6 +4,8 @@ pub mod sm;
 
 use sm::{StallKind, StateMachine};
 
+const TXSTALL_LSB: u32 = 24;
+
 /// One PIO block (RP2350 has three: PIO0, PIO1, PIO2).
 pub struct PioBlock {
     /// Per-SM state. `StateMachine` fields are `pub(crate)` — invariants
@@ -365,6 +367,7 @@ impl PioBlock {
                     &mut self.shared_pin_values,
                     &mut self.shared_pin_dirs,
                 );
+                self.latch_txstall(i);
             }
         }
         self.merge_pin_outputs();
@@ -395,9 +398,9 @@ impl PioBlock {
             .iter()
             .all(|sm| !sm.enabled || sm.can_skip_pull_stall())
         {
-            for sm in &mut self.sm {
-                if sm.enabled {
-                    sm.skip_pull_stall(n - 1);
+            for (i, sm) in self.sm.iter_mut().enumerate() {
+                if sm.enabled && sm.skip_pull_stall(n - 1) {
+                    self.fdebug |= 1 << (TXSTALL_LSB + i as u32);
                 }
             }
             #[cfg(feature = "pio-pad-diag")]
@@ -409,6 +412,13 @@ impl PioBlock {
             for _ in 1..n {
                 self.step_with_pins(gpio_pins);
             }
+        }
+    }
+
+    fn latch_txstall(&mut self, i: usize) {
+        // RP2350 FDEBUG.TXSTALL latches on blocking PULL or autopull starvation.
+        if self.sm[i].stalled && matches!(self.sm[i].stall_kind, StallKind::Pull) {
+            self.fdebug |= 1 << (TXSTALL_LSB + i as u32);
         }
     }
 
@@ -941,6 +951,7 @@ impl PioBlock {
                     &mut self.shared_pin_values,
                     &mut self.shared_pin_dirs,
                 );
+                self.latch_txstall(sm_idx);
             }
             // SMn_PINCTRL
             0x14 => {
@@ -4073,3 +4084,7 @@ impl PioBlock {
 #[cfg(test)]
 #[path = "idle_tests.rs"]
 mod idle_tests;
+
+#[cfg(test)]
+#[path = "txstall_tests.rs"]
+mod txstall_tests;

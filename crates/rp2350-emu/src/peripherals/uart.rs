@@ -1,7 +1,7 @@
 //! RP2350 UART peripheral (PL011-derived; datasheet §12.1).
 //!
 //! Phase 2 of the RP2350 peripheral coverage plan (HLD V5 §6 row 2).
-//! UART0 lives at `0x4007_0000`, UART1 at `0x4007_4000`.
+//! UART0 lives at `0x4007_0000`, UART1 at `0x4007_8000`.
 //!
 //! Mirrors the RP2040 UART (`rp2040_emu::peripherals::uart`) idioms
 //! verbatim — same PL011 register surface, same byte-lane narrow-access
@@ -42,8 +42,8 @@ use crate::irq::IRQ_UART0_IRQ;
 
 /// UART0 base (RP2350 datasheet §12.1.1).
 pub const UART0_BASE: u32 = 0x4007_0000;
-/// UART1 base (RP2350 datasheet §12.1.1, 4 KB stride).
-pub const UART1_BASE: u32 = 0x4007_4000;
+/// UART1 base (RP2350 datasheet §12.1.1, 32 KB stride).
+pub const UART1_BASE: u32 = 0x4007_8000;
 
 /// Offset: `UARTDR` — data register (byte side-effect: FIFO push/pop).
 pub const UARTDR: u32 = 0x000;

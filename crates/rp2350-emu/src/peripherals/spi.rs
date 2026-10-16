@@ -1,7 +1,7 @@
 //! RP2350 SPI peripheral (PL022-derived; datasheet §12.2).
 //!
 //! Phase 2 of the RP2350 peripheral coverage plan (HLD V5 §6 row 2).
-//! SPI0 lives at `0x4008_0000`, SPI1 at `0x4008_4000`.
+//! SPI0 lives at `0x4008_0000`, SPI1 at `0x4008_8000`.
 //!
 //! Mirrors the RP2040 SPI (`rp2040_emu::peripherals::spi`) verbatim. The
 //! only RP2350 deltas are the NVIC IRQ number ([`crate::irq::IRQ_SPI0_IRQ`]
@@ -40,8 +40,8 @@ use crate::irq::IRQ_SPI0_IRQ;
 
 /// SPI0 base (RP2350 datasheet §12.2).
 pub const SPI0_BASE: u32 = 0x4008_0000;
-/// SPI1 base (RP2350 datasheet §12.2, 4 KB stride).
-pub const SPI1_BASE: u32 = 0x4008_4000;
+/// SPI1 base (RP2350 datasheet §12.2, 32 KB stride).
+pub const SPI1_BASE: u32 = 0x4008_8000;
 
 /// Offset: `SSPCR0` — frame format / clock rate.
 pub const SSPCR0: u32 = 0x000;

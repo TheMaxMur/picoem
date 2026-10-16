@@ -193,9 +193,9 @@ fn i2c0_bus_scan_nacks_with_abrt_7b() {
     // Expect TX_ABRT in raw interrupt status (latching, survives STOP).
     let raw = bus.read32(I2C0_BASE + IC_RAW_INTR_STAT, 0);
     assert_ne!(raw & INT_TX_ABRT, 0, "TX_ABRT must latch on NACK");
-    // IC_TX_ABRT_SOURCE is transient -- auto-cleared by STOP on silicon.
+    // The abort cause remains readable after STOP until explicitly cleared.
     let src = bus.read32(I2C0_BASE + IC_TX_ABRT_SOURCE, 0);
-    assert_eq!(src, 0, "tx_abrt_source auto-cleared by STOP");
+    assert_eq!(src, 1, "7-bit address NACK cause survives STOP");
 }
 
 #[test]

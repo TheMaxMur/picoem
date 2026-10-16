@@ -447,11 +447,11 @@ impl ResetsState {
 
 /// APB peripheral register state. Mirrors `bus/mod.rs:253..266`.
 pub struct ApbState {
-    /// UART0/UART1 — PL011-derived UART at 0x4007_0000 / 0x4007_4000.
+    /// UART0/UART1 — PL011-derived UART at 0x4007_0000 / 0x4007_8000.
     pub uart: [UartRegs; 2],
-    /// SPI0/SPI1 — PL022-derived SPI at 0x4008_0000 / 0x4008_4000.
+    /// SPI0/SPI1 — PL022-derived SPI at 0x4008_0000 / 0x4008_8000.
     pub spi: [SpiRegs; 2],
-    /// I2C0/I2C1 — DesignWare DW_apb_i2c at 0x4009_0000 / 0x4009_4000.
+    /// I2C0/I2C1 — DesignWare DW_apb_i2c at 0x4009_0000 / 0x4009_8000.
     pub i2c: [I2cRegs; 2],
     /// ADC — single instance at 0x400A_0000.
     pub adc: AdcRegs,

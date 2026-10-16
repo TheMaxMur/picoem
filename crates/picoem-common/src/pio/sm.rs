@@ -324,7 +324,7 @@ impl StateMachine {
             && self.clkdiv_acc < self.clock_threshold()
     }
 
-    pub(super) fn skip_pull_stall(&mut self, cycles: u32) {
+    pub(super) fn skip_pull_stall(&mut self, cycles: u32) -> bool {
         debug_assert!(self.can_skip_pull_stall());
         let threshold = u64::from(self.clock_threshold());
         let clocks = u64::from(self.clkdiv_acc) + u64::from(cycles) * 256;
@@ -334,6 +334,7 @@ impl StateMachine {
         if self.pc == 0x19 {
             self.cycles_stalled_at_pc_0x19 = self.cycles_stalled_at_pc_0x19.wrapping_add(stalled);
         }
+        stalled != 0
     }
 
     /// Execute one PIO cycle. Called when clock_tick() returns true.

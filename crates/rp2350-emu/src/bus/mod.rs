@@ -324,12 +324,12 @@ pub struct Bus {
     pub(crate) timer0: TimerRegs,
     /// TIMER1 — same shape as TIMER0, driven by the TIMER1 TICKS domain.
     pub(crate) timer1: TimerRegs,
-    /// UART0/1 — PL011-derived UARTs at `0x4007_0000` / `0x4007_4000`
+    /// UART0/1 — PL011-derived UARTs at `0x4007_0000` / `0x4007_8000`
     /// (HLD V5 §6 row 2). Indexed `[0]=UART0`, `[1]=UART1`.
     pub(crate) uart: [UartRegs; 2],
-    /// SPI0/1 — PL022-derived SPIs at `0x4008_0000` / `0x4008_4000`.
+    /// SPI0/1 — PL022-derived SPIs at `0x4008_0000` / `0x4008_8000`.
     pub(crate) spi: [SpiRegs; 2],
-    /// I2C0/1 — DesignWare DW_apb_i2c at `0x4009_0000` / `0x4009_4000`.
+    /// I2C0/1 — DesignWare DW_apb_i2c at `0x4009_0000` / `0x4009_8000`.
     pub(crate) i2c: [I2cRegs; 2],
     /// ADC — single instance at `0x400A_0000`.
     pub(crate) adc: AdcRegs,
