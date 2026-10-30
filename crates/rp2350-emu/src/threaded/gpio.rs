@@ -150,12 +150,20 @@ impl AtomicGpio {
         }
     }
 
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update is newer than the Rust 1.88 MSRV"
+    )]
     pub(crate) fn write_out_masked(&self, bank: usize, value: u32, mask: u32) {
         self.out[bank]
             .fetch_update(Relaxed, Relaxed, |old| Some((old & !mask) | (value & mask)))
             .unwrap();
     }
 
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update is newer than the Rust 1.88 MSRV"
+    )]
     pub(crate) fn write_oe_masked(&self, bank: usize, value: u32, mask: u32) {
         self.oe[bank]
             .fetch_update(Relaxed, Relaxed, |old| Some((old & !mask) | (value & mask)))
