@@ -5,7 +5,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/picoem-common.svg)](https://crates.io/crates/picoem-common)
 [![Docs.rs](https://docs.rs/picoem-common/badge.svg)](https://docs.rs/picoem-common)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](../../LICENSE-AGPL)
 
 Shared primitive types for the [picoem](https://github.com/0x4D44/picoem)
 RP2350 / RP2354 / RP2040 emulator workspace.
@@ -39,9 +39,13 @@ the parts of `picoem-common` that consumers need.
 
 ## License
 
-Dual-licensed under either:
+Upstream code is dual-licensed under either:
 
 - Apache License, Version 2.0
 - MIT license
 
 at your option.
+
+RS-Key additions and changes are AGPL-3.0-only, as identified by their file
+headers; see [LICENSE-AGPL](../../LICENSE-AGPL). This modified package declares
+AGPL-3.0-only. Upstream notices remain in place.

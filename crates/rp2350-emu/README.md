@@ -5,7 +5,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/rp2350-emu.svg)](https://crates.io/crates/rp2350-emu)
 [![Docs.rs](https://docs.rs/rp2350-emu/badge.svg)](https://docs.rs/rp2350-emu)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/0x4D44/picoem)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](../../LICENSE-AGPL)
 
 A cycle-accurate emulator library for the **Raspberry Pi RP2350 / RP2354**
 (dual Arm Cortex-M33 @ 150 MHz, 520 KB SRAM, FPU, coprocessors, PIO).
@@ -105,7 +105,7 @@ QEMU + silicon differential oracles, and design documents, lives at
 
 ## License
 
-Dual-licensed under either:
+Upstream code is dual-licensed under either:
 
 - Apache License, Version 2.0
 - MIT license
@@ -116,3 +116,7 @@ at your option.
 *Arm* and *Cortex-M33* are trademarks or registered trademarks of Arm
 Limited. This project is independent and not affiliated with or endorsed
 by either company.
+
+RS-Key additions and changes are AGPL-3.0-only, as identified by their file
+headers; see [LICENSE-AGPL](../../LICENSE-AGPL). This modified package declares
+AGPL-3.0-only. Upstream notices remain in place.

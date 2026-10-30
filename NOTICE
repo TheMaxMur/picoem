@@ -1,8 +1,11 @@
 picoem — NOTICE
 ==================
 
-The picoem codebase is licensed under MIT OR Apache-2.0 at your option.
-See LICENSE-MIT and LICENSE-APACHE for details.
+The upstream picoem code is licensed under MIT OR Apache-2.0 at your option.
+See LICENSE-MIT and LICENSE-APACHE for details. RS-Key additions and changes
+in rp2350-emu and picoem-common are AGPL-3.0-only, as identified by their file
+headers; see LICENSE-AGPL. The modified packages declare AGPL-3.0-only.
+Upstream copyright and license notices remain in place.
 
 --------------------------------------------------------------------------------
 

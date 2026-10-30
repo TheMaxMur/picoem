@@ -18,7 +18,7 @@ A personal research project, published in case it's useful to others.
 I use these crates in my own work and will likely keep pushing fixes
 as I hit them, but I'm not committing to issue triage, PR review SLAs,
 or ongoing feature development. No promises — if you need certainty
-around a bugfix or feature, fork freely under MIT/Apache-2.0.
+around a bugfix or feature, fork under the applicable terms in [License](#license).
 
 Feature coverage as of the published versions — Arm-mode only; Hazard3
 RISC-V cores on RP2350 are out of scope:
@@ -178,14 +178,18 @@ The `pacer` module uses an `rdtsc` backend on `x86_64` and an `Instant` backend 
 
 ## License
 
-Licensed under either of
+Upstream picoem code is licensed under either of
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
+RS-Key additions and changes to `rp2350-emu` and `picoem-common` are
+AGPL-3.0-only; see their file headers and [LICENSE-AGPL](LICENSE-AGPL). The
+modified packages declare AGPL-3.0-only, while upstream notices are preserved.
+
+For the upstream MIT/Apache code, unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall
 be dual licensed as above, without any additional terms or conditions.
 
