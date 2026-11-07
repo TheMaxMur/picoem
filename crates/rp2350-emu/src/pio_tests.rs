@@ -747,68 +747,28 @@ fn test_pio_resets_gating() {
     );
 }
 
-/// Narrow (byte / halfword) writes to PIO TX FIFO registers must widen
-/// to 32 bit and land as a single FIFO entry. On real RP2350 silicon
-/// the AHB widens any narrow write to a 32-bit transaction before it
-/// reaches the PIO peripheral; a byte write at byte-lane N produces a
-/// `(val as u32) << (N*8)` FIFO entry. DMA byte-mode transfers from
-/// SRAM to a PIO TX FIFO (the OneROM CH1 pattern) rely on this.
-///
-/// Regression: pre-0.2.4 the `Bus::write8` / `Bus::write16` PIO arms
-/// were silent no-ops, so DMA byte transfers vanished even though
-/// `TRANS_COUNT` decremented and `INTR` latched.
+// RP2350 datasheet 2.1.5: lane address does not suppress replication.
 #[test]
-fn pio_narrow_writes_widen_to_32_bit() {
+fn pio_narrow_writes_replicate_bus_data() {
     let mut bus = Bus::new();
-
-    // PIO0 TXF1 (offset 0x014) — byte / halfword / word at byte lane 0.
-    bus.write8(0x5020_0014, 0xCD, 0);
-    assert_eq!(bus.pio[0].pop_tx(1), Some(0x0000_00CD));
-    bus.write16(0x5020_0014, 0xABCD, 0);
-    assert_eq!(bus.pio[0].pop_tx(1), Some(0x0000_ABCD));
-    bus.write32(0x5020_0014, 0xCAFE_F00D, 0);
-    assert_eq!(bus.pio[0].pop_tx(1), Some(0xCAFE_F00D));
-
-    // PIO1 TXF2 (offset 0x018) — confirm the dispatch arm hits the
-    // right block and SM, not just PIO0.
-    bus.write8(0x5030_0018, 0x42, 0);
-    assert_eq!(bus.pio[1].pop_tx(2), Some(0x0000_0042));
-    bus.write16(0x5030_0018, 0xBEEF, 0);
-    assert_eq!(bus.pio[1].pop_tx(2), Some(0x0000_BEEF));
-
-    // PIO2 TXF1 (offset 0x014) — the exact register the OneROM CH1
-    // DMA byte stream targets in the SDRR firmware.
-    bus.write8(0x5040_0014, 0xCD, 0);
-    assert_eq!(bus.pio[2].pop_tx(1), Some(0x0000_00CD));
-    bus.write16(0x5040_0014, 0xABCD, 0);
-    assert_eq!(bus.pio[2].pop_tx(1), Some(0x0000_ABCD));
-    bus.write32(0x5040_0014, 0x1234_5678, 0);
-    assert_eq!(bus.pio[2].pop_tx(1), Some(0x1234_5678));
-
-    // Byte lane within the TXF word: a byte write to TXF0+1 goes to
-    // byte lane 1, producing `0x0000_CD00`. (DMA byte-mode in practice
-    // hits lane 0 because the FIFO is a permanent address; the
-    // higher-lane behaviour is what the AHB widening spec mandates and
-    // what differentiates "drop" from "wrong byte lane".)
-    bus.write8(0x5040_0011, 0xCD, 0);
-    assert_eq!(bus.pio[2].pop_tx(0), Some(0x0000_CD00));
-
-    // Lane 2 byte write — `STRB Rn, [Rm, #2]` against TXF0 base+2
-    // should land at bits [23:16]. Confirms the `(val as u32) <<
-    // (byte_idx * 8)` shift covers the full byte-lane range, not just
-    // lanes 0/1. (TXF0 = offset 0x010; the 0x012 address hits TXF0
-    // word-aligned at 0x010, byte_idx = 2.)
-    bus.write8(0x5040_0012, 0xCD, 0);
-    assert_eq!(bus.pio[2].pop_tx(0), Some(0x00CD_0000));
-
-    // Lane 3 byte write — top byte lane (TXF0, byte_idx = 3).
-    bus.write8(0x5040_0013, 0xCD, 0);
-    assert_eq!(bus.pio[2].pop_tx(0), Some(0xCD00_0000));
-
-    // Halfword lane 1 — `STRH Rn, [Rm, #2]`. The half_idx*16 shift maps
-    // base+2 to bits [31:16]. (TXF0 word-aligned, half_idx = 1.)
-    bus.write16(0x5040_0012, 0xABCD, 0);
-    assert_eq!(bus.pio[2].pop_tx(0), Some(0xABCD_0000));
+    for (block, base) in [0x5020_0000, 0x5030_0000, 0x5040_0000]
+        .into_iter()
+        .enumerate()
+    {
+        for sm in 0..4 {
+            let fifo = base + 0x10 + 4 * sm as u32;
+            for lane in 0..4 {
+                bus.write8(fifo + lane, 0xCD, 0);
+                assert_eq!(bus.pio[block].pop_tx(sm), Some(0xCDCD_CDCD));
+            }
+            for lane in [0, 2] {
+                bus.write16(fifo + lane, 0xABCD, 0);
+                assert_eq!(bus.pio[block].pop_tx(sm), Some(0xABCD_ABCD));
+            }
+            bus.write32(fifo, 0xCAFE_F00D, 0);
+            assert_eq!(bus.pio[block].pop_tx(sm), Some(0xCAFE_F00D));
+        }
+    }
 }
 
 /// Narrow writes to PIO RXF (offsets 0x020..=0x02C) MUST NOT pop the RX

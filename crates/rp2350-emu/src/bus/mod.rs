@@ -2360,39 +2360,10 @@ impl Bus {
                             self.raise_irqs_u64(ext_irqs);
                         }
                         0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {
-                            // PIO narrow writes — silicon AHB5 widens to
-                            // 32-bit with byte strobes. Only TXF
-                            // (offsets 0x010..=0x01C) is a meaningful
-                            // narrow-write target in firmware: DMA
-                            // byte-mode pacing pushes one byte per
-                            // transfer to TXF for the OneROM CPU-serve
-                            // idiom.
-                            //
-                            // Every other PIO register has either a
-                            // destructive read side effect (RXF: read
-                            // pops the FIFO) or a destructive write
-                            // side effect that the standard subword-
-                            // alias RMW would trigger incorrectly:
-                            //   - FDEBUG / IRQ are W1C and read live
-                            //     state, so RMW splice clears unchanged
-                            //     byte lanes (UART/SPI/I2C templates
-                            //     avoid this because their W1C registers
-                            //     read as 0).
-                            //   - SMn_INSTR force-executes on write, so
-                            //     RMW would run `(last_insn[31:8] | val)`
-                            //     instead of silicon's `(0x0000 | val)`.
-                            //   - CTRL byte 1 holds self-clearing
-                            //     SM_RESTART bits.
-                            //   - SHIFTCTRL byte 3 holds FJOIN bits that
-                            //     drop FIFO contents on change.
-                            // Drop narrow writes to non-TXF PIO
-                            // registers — matches the rp2040-emu sibling
-                            // crate's design philosophy (per chip's bus
-                            // generation: AHB-Lite replicates, AHB5
-                            // strobes — same outcome for the bottom byte
-                            // that PIO's `OUT PINS, 8` cares about).
+                            // RP2350 datasheet 2.1.5: ordinary narrow IO writes
+                            // replicate across all lanes, including the PIO TX FIFO.
                             let word_addr = canonical & !3;
-                            let byte_idx = (canonical & 3) as usize;
+
                             let reg_offset = word_addr & 0x0000_0FFF;
                             if (0x010..=0x01C).contains(&reg_offset) {
                                 let pio_idx = match base {
@@ -2400,7 +2371,7 @@ impl Bus {
                                     0x5030_0000 => 1,
                                     _ => 2,
                                 };
-                                let word_val = (val as u32) << (byte_idx * 8);
+                                let word_val = u32::from(val) * 0x0101_0101;
                                 self.pio[pio_idx].write32(reg_offset, word_val, alias);
                             }
                         }
@@ -3168,15 +3139,10 @@ impl Bus {
                             self.raise_irqs_u64(ext_irqs);
                         }
                         0x5020_0000 | 0x5030_0000 | 0x5040_0000 => {
-                            // PIO narrow halfword: same AHB-widening
-                            // story and same TXF-only-widen policy as
-                            // the byte arm. See the `write8` PIO arm
-                            // above for the full rationale (FDEBUG/IRQ
-                            // W1C, SMn_INSTR force-execute, CTRL byte 1
-                            // SM_RESTART, SHIFTCTRL byte 3 FJOIN, RXF
-                            // destructive read).
+                            // RP2350 datasheet 2.1.5: ordinary narrow IO writes
+                            // replicate across all lanes, including the PIO TX FIFO.
                             let word_addr = canonical & !3;
-                            let half_idx = ((canonical >> 1) & 1) as usize;
+
                             let reg_offset = word_addr & 0x0000_0FFF;
                             if (0x010..=0x01C).contains(&reg_offset) {
                                 let pio_idx = match base {
@@ -3184,7 +3150,7 @@ impl Bus {
                                     0x5030_0000 => 1,
                                     _ => 2,
                                 };
-                                let word_val = (val as u32) << (half_idx * 16);
+                                let word_val = u32::from(val) * 0x0001_0001;
                                 self.pio[pio_idx].write32(reg_offset, word_val, alias);
                             }
                         }
