@@ -38,16 +38,12 @@ impl CortexM33 {
             return self.security_fault(addr, SFSR_INVEP);
         };
         if !self.secure {
-            let first = self.security_attribution(addr);
-            let last = self.security_attribution(end);
-            // RP2350 ROM has a fixed instruction-side split, independent of SAU.
-            if addr < 0x4300 {
-                return self.security_fault(addr, SFSR_INVEP);
-            }
+            let first = self.fetch_attribution(addr);
+            let last = self.fetch_attribution(end);
             if first.nsc && last.nsc {
                 if bus.read16(addr, self.core_id) == 0xe97f
                     && bus.read16(addr.wrapping_add(2), self.core_id) == 0xe97f
-                    && self.security_attribution(addr.wrapping_add(3)).nsc
+                    && self.fetch_attribution(addr.wrapping_add(3)).nsc
                 {
                     return true;
                 }

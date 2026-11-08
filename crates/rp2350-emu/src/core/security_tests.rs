@@ -168,10 +168,39 @@ fn nonsecure_mpu_denies_ro_writes_and_xn_fetches() {
 }
 
 #[test]
+fn nonsecure_rom_fetch_distinguishes_shared_and_secure_text() {
+    const SHARED_ROM: u32 = 0x3346;
+    const SECURE_ROM: u32 = 0x4300;
+    const NS_ROM: u32 = 0x4a00;
+    let mut rom = [0u8; 0x8000];
+    for address in [SHARED_ROM, SECURE_ROM, NS_ROM] {
+        rom[address as usize..][..2].copy_from_slice(&0x2042u16.to_le_bytes()); // MOVS r0, #0x42.
+    }
+    for (address, allowed) in [(SHARED_ROM, true), (SECURE_ROM, false), (NS_ROM, true)] {
+        let (mut cpu, mut bus) = machine(0xbf00);
+        cpu.ppb.sau_regions[7] = (NS_ROM, 0x7fe1);
+        bus.load_bootrom(&rom);
+        cpu.regs.set_pc(address);
+        cpu.step(&mut bus);
+        assert_eq!(
+            cpu.regs.r[0],
+            if allowed { 0x42 } else { 0 },
+            "ROM {address:#x}"
+        );
+        assert_eq!(
+            cpu.regs.ipsr(),
+            if allowed { 0 } else { 7 },
+            "ROM {address:#x}"
+        );
+        assert_eq!(cpu.secure, !allowed, "ROM {address:#x}");
+    }
+}
+
+#[test]
 fn rom_hooks_cannot_bypass_secure_fetch_attribution() {
     let (mut cpu, mut bus) = machine(0xbf00);
-    cpu.bootrom_reboot_hook_pc_s = Some(0x100);
-    cpu.regs.set_pc(0x100);
+    cpu.bootrom_reboot_hook_pc_s = Some(0x4300);
+    cpu.regs.set_pc(0x4300);
     cpu.step(&mut bus);
     assert!(!cpu.bootrom_hook_fired);
     assert_eq!(cpu.regs.ipsr(), 7);
@@ -355,6 +384,7 @@ fn secure_grant_allows_real_nonsecure_usb_access() {
 fn nonsecure_rom_hooks_obey_bus_permissions() {
     let (mut cpu, mut bus) = machine(0xbf00);
     cpu.bootrom_reboot_hook_pc_ns = Some(0x5000);
+    cpu.ppb.sau_regions[7] = (0x5000, 0x7fe1);
     cpu.regs.set_pc(0x5000);
     bus.write32(0x4006_0014, 0xacce_0038, 0);
     cpu.step(&mut bus);

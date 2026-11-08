@@ -989,7 +989,20 @@ impl CortexM33 {
     /// the SAU and the RP2350 IDAU, whichever is more secure. An Exempt
     /// address takes the current security state and reports no region.
     pub(crate) fn security_attribution(&self, addr: u32) -> SecurityAttribution {
-        let idau = rp2350_idau(addr);
+        self.attribute_address(addr, rp2350_idau(addr))
+    }
+
+    pub(crate) fn fetch_attribution(&self, addr: u32) -> SecurityAttribution {
+        // Only the first 0x4300 ROM bytes are instruction-side Exempt.
+        // The SAU divides the rest of the text before the SG veneers.
+        let idau = match addr {
+            0x4300..=0x7dff => Idau::NonSecure { region: None },
+            _ => rp2350_idau(addr),
+        };
+        self.attribute_address(addr, idau)
+    }
+
+    fn attribute_address(&self, addr: u32, idau: Idau) -> SecurityAttribution {
         let (idau_nsc, iregion) = match idau {
             Idau::Exempt => {
                 return SecurityAttribution {
@@ -1052,9 +1065,7 @@ enum Idau {
 /// Non-secure callable (IDAU region 2, as the bootrom's `tt` self-test
 /// expects: 0x02CE0700). The peripherals, USB RAM included ("IDAU Exempt,
 /// ACCESSCTRL NS", varm_nsboot.c), SIO and the PPB are Exempt. Everything
-/// else is Non-secure with no region, so the SAU decides. (The ROM's
-/// instruction-side split at 0x4300 is not modelled: picoem tracks the
-/// security state by transitions, not by fetch attribution.)
+/// else is Non-secure with no region, so the SAU decides.
 fn rp2350_idau(addr: u32) -> Idau {
     match addr {
         0x0000_0000..=0x0000_7DFF => Idau::Exempt,
